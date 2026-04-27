@@ -1,4 +1,4 @@
-Thermal Plate Simulator v12
+Thermal Plate Simulator v13
 ===========================
 
 This package is intended to run on:
@@ -11,7 +11,7 @@ Main files
 ----------
 
 - run_thermal_sim.py              Cross-platform launcher
-- thermal_plate_sim_v12_gui.py    GUI
+- thermal_plate_sim_v13_gui.py    GUI
 - thermal_core.py                 Simulation engine
 - requirements.txt                Python dependencies
 
@@ -82,7 +82,7 @@ On Arch/EndeavourOS:
     sudo pacman -S tk
 
 
-v12 changes
+v13 changes
 --------------------------
 
 - macOS Tk warning suppression.
@@ -108,7 +108,7 @@ Notes
 The simulator is still an engineering approximation. For real resistor dump hardware, use a temperature sensor, fuses, and thermal cutoff.
 
 
-v12 changes
+v13 changes
 -----------
 - Improved 3D resistor visibility:
   - transparent plate mode
@@ -121,3 +121,10 @@ v12 changes
 - Heatsink dialog now includes "Thermal segments":
   - auto = recommended
   - a number forces that many segments per fin
+
+
+v13 changes
+-----------
+- The 3D view now uses the same heatmap colormap as the 2D view.
+- The 3D view now also follows the same fixed-scale temperature range logic as the 2D view.
+- This keeps 2D and 3D colors consistent for the same snapshot.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v12_gui.py
+thermal_plate_sim_v13_gui.py
 
 Cross-platform thermal plate simulator with segmented fin transfer, improved 3D viewer, and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
@@ -9,7 +9,7 @@ Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v12_gui.py
+    python thermal_plate_sim_v13_gui.py
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v12")
+        self.title("Thermal Plate Simulator v13")
 
         # Cross-platform initial window sizing.
         # macOS laptops and smaller Linux/Windows screens can be shorter than
@@ -170,8 +170,8 @@ class ThermalPlateGUI(tk.Tk):
             help_menu.add_command(
                 label="About",
                 command=lambda: messagebox.showinfo(
-                    "Thermal Plate Simulator v12",
-                    "Thermal Plate Simulator v12\nCross-platform GUI for Windows, macOS, and Linux."
+                    "Thermal Plate Simulator v13",
+                    "Thermal Plate Simulator v13\nCross-platform GUI for Windows, macOS, and Linux."
                 )
             )
             menubar.add_cascade(label="Help", menu=help_menu)
@@ -1053,6 +1053,25 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
         iy = int(np.argmin(np.abs(ys_cm - y_cm)))
         return float(temp[ix, iy])
 
+    def _heatmap_cmap(self):
+        """Return the same colormap used by the 2D heatmap view."""
+        # The 2D imshow view uses Matplotlib's default colormap unless specified.
+        # In standard Matplotlib that is 'viridis', and cm.get_cmap() returns
+        # the active default colormap object.
+        return cm.get_cmap()
+
+    def _heatmap_norm_limits_for_temp(self, temp):
+        """Use the same temperature scaling rule as the 2D view."""
+        if self.fixed_scale_var.get() and self.vmin is not None:
+            vmin = float(self.vmin)
+            vmax = float(self.vmax)
+        else:
+            vmin = float(np.min(temp))
+            vmax = float(np.max(temp))
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+        return vmin, vmax
+
     def _box_faces_3d(self, cx, cy, cz, sx, sy, sz):
         x0, x1 = cx - sx / 2.0, cx + sx / 2.0
         y0, y1 = cy - sy / 2.0, cy + sy / 2.0
@@ -1142,14 +1161,12 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                 X, Y = np.meshgrid(x_cm, y_cm, indexing="ij")
 
                 t_cm = max(0.02, cfg.plate_thickness_mm/10.0)
-                vmin = float(np.min(temp))
-                vmax = float(np.max(temp))
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
+                cmap = self._heatmap_cmap()
+                vmin, vmax = self._heatmap_norm_limits_for_temp(temp)
                 norm = Normalize(vmin=vmin, vmax=vmax)
 
                 plate_alpha = 0.48 if transparent_plate.get() else 1.0
-                colors = cm.inferno(norm(temp))
+                colors = cmap(norm(temp))
                 colors[..., 3] = plate_alpha
 
                 ax3.plot_surface(X, Y, np.zeros_like(X), facecolors=colors, shade=False, linewidth=0, antialiased=False, alpha=plate_alpha)
@@ -1168,7 +1185,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                         fr = max(0.02, fin["footprint_y_cm"])
                         fh = max(0.02, fin["height_mm"]/10.0)
                         tc = self._temp_nearest_3d(fx, fy, x_cm, y_cm, temp)
-                        self._add_box_3d(ax3, fx, fy, -t_cm - fh/2.0, fw, fr, fh, cm.inferno(norm(tc)), alpha=0.72)
+                        self._add_box_3d(ax3, fx, fy, -t_cm - fh/2.0, fw, fr, fh, cmap(norm(tc)), alpha=0.72)
 
                 resistor_edge_boxes = []
                 if show_res.get():
@@ -1185,7 +1202,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                         sy = max(0.03, r.width_mm/10.0)
                         sz = 0.55
                         tc = self._temp_nearest_3d(r.center_x_cm, r.center_y_cm, x_cm, y_cm, temp)
-                        col = cm.inferno(norm(tc))
+                        col = cmap(norm(tc))
                         for zc, sign in z_sides:
                             self._add_box_3d(ax3, r.center_x_cm, r.center_y_cm, zc, sx, sy, sz, col, alpha=0.96)
                             resistor_edge_boxes.append((r.center_x_cm, r.center_y_cm, zc, sx, sy, sz))
@@ -1195,7 +1212,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                     for args in resistor_edge_boxes:
                         self._add_box_edges_3d(ax3, *args, color="black", linewidth=0.95)
 
-                mappable = cm.ScalarMappable(norm=norm, cmap=cm.inferno)
+                mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
                 mappable.set_array(temp)
                 fig.colorbar(mappable, ax=ax3, shrink=0.70, pad=0.02, label="Temperature, °C")
 
