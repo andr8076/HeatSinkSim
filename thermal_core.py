@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v6_gui.py
+thermal_plate_sim_v8_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
-Adds live layout preview, advanced cooling, even-spread banks, and a deeper finite-difference-assisted optimizer.
+Adds live layout preview, advanced cooling, heatsink support, even-spread banks, and a deeper multi-worker optimizer.
 
 Features:
   - Tkinter UI
@@ -15,7 +15,7 @@ Features:
   - Advanced cooling estimator for orientation, enclosure, wall clearance, surface, air movement, hot-air path, and blockage
   - Live plate/resistor layout preview before running
   - Even-spread resistor bank generator
-  - Deep optimizer for resistor locations using fast scoring plus coarse finite-difference heat solves
+  - Deep multi-worker optimizer for resistor locations using fast scoring plus coarse finite-difference heat solves
   - Field help window
   - Config save/load as JSON
   - Export current heatmap PNG
@@ -40,13 +40,15 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v6_gui.py
+  python3 thermal_plate_sim_v8_gui.py
 """
 
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import itertools
+import os
 import json
 import math
 import queue
@@ -116,6 +118,15 @@ class PlateConfig:
     hot_air_path: str = "free_rise"
     blockage_percent: float = 0.0
     cooling_notes: str = ""
+
+    # Optional heatsink / fins support. This is modeled as extra effective exposed
+    # area, spread across the plate. It is most accurate for a heatsink/finned
+    # plate attached broadly to the back of the plate, not a tiny local heatsink.
+    heatsink_enabled: bool = False
+    heatsink_extra_area_cm2: float = 0.0
+    heatsink_efficiency_percent: float = 70.0
+    heatsink_h_multiplier: float = 1.0
+    heatsink_notes: str = ""
 
 
 @dataclass
@@ -206,6 +217,38 @@ def safe_time_name(label: str) -> str:
         .replace("/", "_")
         .replace("°", "")
     )
+
+
+def effective_convection_h_for_solver(cfg: "PlateConfig") -> float:
+    """Return the equivalent h value used by the solver.
+
+    A heatsink/finned surface is approximated as extra effective exposed area.
+    This keeps the UI simple and works best for a heatsink attached broadly to
+    the plate, not a tiny local heatsink.
+    """
+    base_h = max(0.05, float(cfg.convection_h_w_m2k))
+    if not getattr(cfg, "heatsink_enabled", False):
+        return base_h
+
+    plate_l_m = max(1e-6, cfg.plate_length_cm / 100.0)
+    plate_w_m = max(1e-6, cfg.plate_width_cm / 100.0)
+    base_area_m2 = max(1e-9, 2.0 * plate_l_m * plate_w_m)
+
+    extra_area_m2 = max(0.0, getattr(cfg, "heatsink_extra_area_cm2", 0.0)) / 10000.0
+    eff = max(0.0, min(100.0, getattr(cfg, "heatsink_efficiency_percent", 70.0))) / 100.0
+    hmul = max(0.0, getattr(cfg, "heatsink_h_multiplier", 1.0))
+
+    effective_area_m2 = base_area_m2 + extra_area_m2 * eff * hmul
+    return base_h * effective_area_m2 / base_area_m2
+
+
+def heatsink_effective_extra_area_cm2(cfg: "PlateConfig") -> float:
+    if not getattr(cfg, "heatsink_enabled", False):
+        return 0.0
+    extra = max(0.0, getattr(cfg, "heatsink_extra_area_cm2", 0.0))
+    eff = max(0.0, min(100.0, getattr(cfg, "heatsink_efficiency_percent", 70.0))) / 100.0
+    hmul = max(0.0, getattr(cfg, "heatsink_h_multiplier", 1.0))
+    return extra * eff * hmul
 
 
 ORIENTATION_OPTIONS = {
@@ -406,7 +449,7 @@ def explicit_stability_dt(cfg: PlateConfig, dx_m: float, dy_m: float) -> float:
     rho = cfg.density_kg_m3
     cp = cfg.heat_capacity_j_kgk
     t = cfg.plate_thickness_mm / 1000.0
-    h = cfg.convection_h_w_m2k
+    h = effective_convection_h_for_solver(cfg)
 
     alpha = k / (rho * cp)
     beta = 2.0 * h / (rho * cp * t)
@@ -433,7 +476,7 @@ def solve_steady_state(
     """
     k = cfg.thermal_conductivity_w_mk
     t = cfg.plate_thickness_mm / 1000.0
-    h = cfg.convection_h_w_m2k
+    h = effective_convection_h_for_solver(cfg)
 
     theta = np.zeros_like(q_w_m2, dtype=float)
 
@@ -492,7 +535,7 @@ def run_simulation(
     cp = cfg.heat_capacity_j_kgk
     t_m = cfg.plate_thickness_mm / 1000.0
     k = cfg.thermal_conductivity_w_mk
-    h = cfg.convection_h_w_m2k
+    h = effective_convection_h_for_solver(cfg)
 
     alpha = k / (rho * cp)
     beta = 2.0 * h / (rho * cp * t_m)
@@ -638,9 +681,10 @@ def calculate_summary(
     heat_capacity_j_c = mass_kg * cfg.heat_capacity_j_kgk
     total_power_w = sum(r.power_w for r in cfg.resistors)
 
-    simple_average_final_rise_c = total_power_w / (cfg.convection_h_w_m2k * top_bottom_area_m2)
+    effective_h = effective_convection_h_for_solver(cfg)
+    simple_average_final_rise_c = total_power_w / (effective_h * top_bottom_area_m2)
 
-    tau_s = heat_capacity_j_c / (cfg.convection_h_w_m2k * top_bottom_area_m2)
+    tau_s = heat_capacity_j_c / (effective_h * top_bottom_area_m2)
     t90_s = -math.log(0.10) * tau_s
     t95_s = -math.log(0.05) * tau_s
 
@@ -657,7 +701,7 @@ def calculate_summary(
             "avg_temp_c": float(np.mean(temp)),
             "max_temp_c": float(np.max(temp)),
             "min_temp_c": float(np.min(temp)),
-            "convective_loss_w": float(np.sum(2.0 * cfg.convection_h_w_m2k * theta * cell_area)),
+            "convective_loss_w": float(np.sum(2.0 * effective_h * theta * cell_area)),
         }
 
         for r, mask, covered_area_m2 in resistor_masks:
@@ -686,6 +730,11 @@ def calculate_summary(
         "plate_area_with_edges_cm2": (top_bottom_area_m2 + edge_area_m2) * 10000.0,
         "mass_kg": mass_kg,
         "heat_capacity_j_per_c": heat_capacity_j_c,
+        "base_h_w_m2k": cfg.convection_h_w_m2k,
+        "effective_convection_h_w_m2k": effective_h,
+        "heatsink_enabled": getattr(cfg, "heatsink_enabled", False),
+        "heatsink_raw_extra_area_cm2": getattr(cfg, "heatsink_extra_area_cm2", 0.0),
+        "heatsink_effective_extra_area_cm2": heatsink_effective_extra_area_cm2(cfg),
         "simple_average_final_rise_c": simple_average_final_rise_c,
         "tau_s": tau_s,
         "t90_s": t90_s,
@@ -1395,7 +1444,7 @@ def _optimizer_cfg_with_positions(cfg: PlateConfig, positions: List[Tuple[float,
         density_kg_m3=cfg.density_kg_m3,
         heat_capacity_j_kgk=cfg.heat_capacity_j_kgk,
         ambient_c=cfg.ambient_c,
-        convection_h_w_m2k=cfg.convection_h_w_m2k,
+        convection_h_w_m2k=effective_convection_h_for_solver(cfg),
         grid_mm=grid_mm,
         resistors=rs,
         initial_plate_temp_c=cfg.initial_plate_temp_c,
@@ -1646,6 +1695,7 @@ def optimize_layout_deep(
     depth: str = "Deep",
     progress_callback=None,
     stop_event: Optional[threading.Event] = None,
+    worker_count: int = 1,
 ) -> Tuple[List[Tuple[float, float]], float, int, Dict]:
     """
     v6 deeper optimizer.
@@ -1707,11 +1757,19 @@ def optimize_layout_deep(
     optimizer_grid_mm = max(3.0, float(optimizer_grid_mm))
     coarse_grid_mm = optimizer_grid_mm
     fine_grid_mm = max(3.0, optimizer_grid_mm * settings["fine_grid_factor"])
+    try:
+        auto_workers = max(1, min(8, os.cpu_count() or 1))
+        worker_count = int(worker_count)
+        if worker_count <= 0:
+            worker_count = auto_workers
+        worker_count = max(1, min(worker_count, auto_workers))
+    except Exception:
+        worker_count = 1
 
     if progress_callback is not None:
         progress_callback(
             f"Deep optimizer started: depth={depth}, coarse grid={coarse_grid_mm:g} mm, "
-            f"fine check grid={fine_grid_mm:g} mm"
+            f"fine check grid={fine_grid_mm:g} mm, workers={worker_count}"
         )
 
     candidates = generate_candidate_layouts(cfg.resistors, plate_x_cm, plate_y_cm, margin_cm)
@@ -1729,7 +1787,7 @@ def optimize_layout_deep(
             plate_y_cm=plate_y_cm,
             k_w_mk=cfg.thermal_conductivity_w_mk,
             thickness_mm=cfg.plate_thickness_mm,
-            h_w_m2k=cfg.convection_h_w_m2k,
+            h_w_m2k=effective_convection_h_for_solver(cfg),
             margin_cm=margin_cm,
             progress_callback=None,
             stop_event=stop_event,
@@ -1766,7 +1824,7 @@ def optimize_layout_deep(
             plate_y_cm=plate_y_cm,
             k_w_mk=cfg.thermal_conductivity_w_mk,
             thickness_mm=cfg.plate_thickness_mm,
-            h_w_m2k=cfg.convection_h_w_m2k,
+            h_w_m2k=effective_convection_h_for_solver(cfg),
             margin_cm=margin_cm,
         )
 
@@ -1807,29 +1865,61 @@ def optimize_layout_deep(
     cache: Dict = {}
     fd_ranked = []
     tried = len(unique)
+    top_fd_candidates = fast_shortlist[:settings["top_fd"]]
 
-    for idx, layout in enumerate(fast_shortlist[:settings["top_fd"]], 1):
-        if stop_event is not None and stop_event.is_set():
-            raise RuntimeError("Optimization was cancelled.")
-
+    def _fd_task(layout):
+        local_cache = {} if worker_count > 1 else cache
         score, info = _score_layout_by_coarse_heat_solve(
             cfg,
             layout,
             margin_cm,
             coarse_grid_mm,
-            cache,
+            local_cache,
             stop_event=stop_event,
             max_iter=1800,
             tolerance_c=0.035,
         )
-        tried += 1
-        fd_ranked.append((score, layout, info))
+        return score, layout, info
 
-        if progress_callback is not None and (idx == 1 or idx % 5 == 0 or idx == settings["top_fd"]):
-            progress_callback(
-                f"Coarse heat solve {idx}/{min(settings['top_fd'], len(fast_shortlist))}: "
-                f"current best max≈{min(x[2].get('plate_max_c', x[0]) for x in fd_ranked):.1f} °C"
+    if worker_count > 1 and len(top_fd_candidates) > 1:
+        completed = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_fd_task, layout) for layout in top_fd_candidates]
+            for fut in concurrent.futures.as_completed(futures):
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Optimization was cancelled.")
+                score, layout, info = fut.result()
+                tried += 1
+                completed += 1
+                fd_ranked.append((score, layout, info))
+                if progress_callback is not None and (completed == 1 or completed % 5 == 0 or completed == len(top_fd_candidates)):
+                    progress_callback(
+                        f"Coarse heat solve {completed}/{len(top_fd_candidates)} using {worker_count} workers: "
+                        f"current best max≈{min(x[2].get('plate_max_c', x[0]) for x in fd_ranked):.1f} °C"
+                    )
+    else:
+        for idx, layout in enumerate(top_fd_candidates, 1):
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Optimization was cancelled.")
+
+            score, info = _score_layout_by_coarse_heat_solve(
+                cfg,
+                layout,
+                margin_cm,
+                coarse_grid_mm,
+                cache,
+                stop_event=stop_event,
+                max_iter=1800,
+                tolerance_c=0.035,
             )
+            tried += 1
+            fd_ranked.append((score, layout, info))
+
+            if progress_callback is not None and (idx == 1 or idx % 5 == 0 or idx == len(top_fd_candidates)):
+                progress_callback(
+                    f"Coarse heat solve {idx}/{len(top_fd_candidates)}: "
+                    f"current best max≈{min(x[2].get('plate_max_c', x[0]) for x in fd_ranked):.1f} °C"
+                )
 
     fd_ranked = sorted(fd_ranked, key=lambda x: x[0])
     if not fd_ranked:
@@ -1901,6 +1991,7 @@ def optimize_layout_deep(
         "final_plate_avg_c": fine_info.get("plate_avg_c"),
         "final_grid_cells": fine_info.get("grid_cells"),
         "score": fine_score,
+        "worker_count": worker_count,
     }
 
     if progress_callback is not None:
@@ -1916,7 +2007,7 @@ class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v6")
+        self.title("Thermal Plate Simulator v8")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
