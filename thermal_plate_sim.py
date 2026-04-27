@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v5_gui.py
+thermal_plate_sim_v5_1_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v5_gui.py
+  python3 thermal_plate_sim_v5_1_gui.py
 """
 
 from __future__ import annotations
@@ -891,7 +891,7 @@ class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v5")
+        self.title("Thermal Plate Simulator v5.1")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
@@ -931,8 +931,56 @@ class ThermalPlateGUI(tk.Tk):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self, padding=8)
-        left.grid(row=0, column=0, sticky="ns")
+        # Left side is scrollable. v5 added enough controls that the old fixed
+        # panel could run below the bottom of smaller screens.
+        left_outer = ttk.Frame(self)
+        left_outer.grid(row=0, column=0, sticky="ns")
+        left_outer.rowconfigure(0, weight=1)
+        left_outer.columnconfigure(0, weight=1)
+
+        self.left_canvas = tk.Canvas(left_outer, width=430, highlightthickness=0)
+        self.left_canvas.grid(row=0, column=0, sticky="ns")
+
+        left_scroll = ttk.Scrollbar(left_outer, orient="vertical", command=self.left_canvas.yview)
+        left_scroll.grid(row=0, column=1, sticky="ns")
+        self.left_canvas.configure(yscrollcommand=left_scroll.set)
+
+        left = ttk.Frame(self.left_canvas, padding=8)
+        self.left_window_id = self.left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _update_scrollregion(event=None):
+            self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+
+        def _fit_inner_width(event):
+            # Keep the inner frame equal to the canvas width so entries/buttons
+            # do not get clipped horizontally.
+            self.left_canvas.itemconfigure(self.left_window_id, width=event.width)
+
+        def _wheel_windows(event):
+            # Windows/macOS mousewheel. Negative delta scrolls down.
+            self.left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _wheel_linux_up(event):
+            self.left_canvas.yview_scroll(-3, "units")
+
+        def _wheel_linux_down(event):
+            self.left_canvas.yview_scroll(3, "units")
+
+        def _bind_mousewheel(event):
+            self.left_canvas.bind_all("<MouseWheel>", _wheel_windows)
+            self.left_canvas.bind_all("<Button-4>", _wheel_linux_up)
+            self.left_canvas.bind_all("<Button-5>", _wheel_linux_down)
+
+        def _unbind_mousewheel(event):
+            self.left_canvas.unbind_all("<MouseWheel>")
+            self.left_canvas.unbind_all("<Button-4>")
+            self.left_canvas.unbind_all("<Button-5>")
+
+        left.bind("<Configure>", _update_scrollregion)
+        self.left_canvas.bind("<Configure>", _fit_inner_width)
+        self.left_canvas.bind("<Enter>", _bind_mousewheel)
+        self.left_canvas.bind("<Leave>", _unbind_mousewheel)
+
         left.columnconfigure(0, weight=1)
 
         right = ttk.Frame(self, padding=8)
