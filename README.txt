@@ -1,4 +1,4 @@
-Thermal Plate Simulator v14
+Thermal Plate Simulator v15.2
 ===========================
 
 This package is intended to run on:
@@ -11,7 +11,7 @@ Main files
 ----------
 
 - run_thermal_sim.py              Cross-platform launcher
-- thermal_plate_sim_v14_gui.py    GUI
+- thermal_plate_sim_v15.2_1_gui.py    GUI
 - thermal_core.py                 Simulation engine
 - requirements.txt                Python dependencies
 
@@ -82,7 +82,7 @@ On Arch/EndeavourOS:
     sudo pacman -S tk
 
 
-v14 changes
+v15.2 changes
 --------------------------
 
 - macOS Tk warning suppression.
@@ -108,7 +108,7 @@ Notes
 The simulator is still an engineering approximation. For real resistor dump hardware, use a temperature sensor, fuses, and thermal cutoff.
 
 
-v14 changes
+v15.2 changes
 -----------
 - Improved 3D resistor visibility:
   - transparent plate mode
@@ -123,14 +123,14 @@ v14 changes
   - a number forces that many segments per fin
 
 
-v14 changes
+v15.2 changes
 -----------
 - The 3D view now uses the same heatmap colormap as the 2D view.
 - The 3D view now also follows the same fixed-scale temperature range logic as the 2D view.
 - This keeps 2D and 3D colors consistent for the same snapshot.
 
 
-v14 changes
+v15.2 changes
 -----------
 - Fin height temperature gradient in the 3D viewer:
   - each fin thermal segment is split into vertical slices
@@ -147,3 +147,38 @@ v14 changes
   - reports hottest plate point coordinates
   - adds precision notes when grid resolution is too coarse for resistor footprints
   - 3D resistor blocks are colored by estimated case/body temperature
+
+
+v15.2 changes
+-----------
+- Much faster fin cooling-map calculation:
+  - fin thermal segments are applied by grid index slices instead of full boolean masks
+  - automatic fin segmentation is less excessive by default
+- 3D viewer performance controls:
+  - Fast / Balanced / Detailed quality selector
+  - Fast mode draws fewer fin segment boxes and fewer height slices
+  - Detailed mode keeps the richer fin gradient
+- 2D heatmap fin overlay:
+  - optional "Show fins in 2D heatmap" checkbox
+  - fins are shown as dashed geometry overlays without replacing heatmap colors
+
+
+v15.2 changes
+-------------
+- Replaces reduced-detail fin rendering with batched 3D rendering.
+- Full / batched mode keeps every fin segment and every height slice.
+- Fins and resistors are drawn as large Poly3DCollection batches to remove most per-object overhead.
+- Simplified mode remains only as an emergency fallback for very old/slow machines.
+
+
+v15.2 changes
+-------------
+- Entire 3D rendering system replaced.
+- The 3D viewer no longer uses Matplotlib mplot3d.
+- New viewer uses a custom Tk Canvas projection renderer:
+  - direct polygon rendering
+  - fast yaw/elevation/zoom controls
+  - mouse drag rotation
+  - same heatmap colormap
+  - fin geometry and height gradients still shown
+- This is not a physically new solver; it is a faster engineering visualization layer.

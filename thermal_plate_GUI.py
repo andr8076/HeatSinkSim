@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v14_gui.py
+thermal_plate_sim_v15_2_gui.py
 
 Cross-platform thermal plate simulator with segmented fin transfer, improved 3D viewer, and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
@@ -9,7 +9,7 @@ Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v14_gui.py
+    python thermal_plate_sim_v15_2_gui.py
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v14")
+        self.title("Thermal Plate Simulator v15.2")
 
         # Cross-platform initial window sizing.
         # macOS laptops and smaller Linux/Windows screens can be shorter than
@@ -171,8 +171,8 @@ class ThermalPlateGUI(tk.Tk):
             help_menu.add_command(
                 label="About",
                 command=lambda: messagebox.showinfo(
-                    "Thermal Plate Simulator v14",
-                    "Thermal Plate Simulator v14\nCross-platform GUI for Windows, macOS, and Linux."
+                    "Thermal Plate Simulator v15.2",
+                    "Thermal Plate Simulator v15.2\nCross-platform GUI for Windows, macOS, and Linux."
                 )
             )
             menubar.add_cascade(label="Help", menu=help_menu)
@@ -201,6 +201,7 @@ class ThermalPlateGUI(tk.Tk):
         self.snapshot_every_var = tk.StringVar(value="1m")
         self.include_steady_var = tk.BooleanVar(value=True)
         self.fixed_scale_var = tk.BooleanVar(value=True)
+        self.show_fin_overlay_2d_var = tk.BooleanVar(value=True)
 
         self.max_plate_temp_var = tk.StringVar(value="90")
         self.max_res_case_temp_var = tk.StringVar(value="120")
@@ -251,6 +252,7 @@ class ThermalPlateGUI(tk.Tk):
         self.optimizer_grid_var = tk.StringVar(value="12")
         self.optimizer_workers_var = tk.StringVar(value="0")
         self.resistor_side_var = tk.StringVar(value="Front / flat side")
+        self.viewer_3d_quality_var = tk.StringVar(value="Canvas detailed")
 
         self.e_supply_v_var = tk.StringVar(value="28")
         self.e_res_ohm_var = tk.StringVar(value="1")
@@ -409,6 +411,7 @@ class ThermalPlateGUI(tk.Tk):
         ttk.Button(run, text="Save config", command=self._save_config).grid(row=1, column=0, sticky="ew", pady=2)
         ttk.Button(run, text="Load config", command=self._load_config).grid(row=1, column=1, sticky="ew", padx=(4,0), pady=2)
         ttk.Checkbutton(run, text="Fixed heatmap color scale", variable=self.fixed_scale_var, command=self._redraw_current).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6,0))
+        ttk.Checkbutton(run, text="Show fins in 2D heatmap", variable=self.show_fin_overlay_2d_var, command=self._redraw_current).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4,0))
 
     def _build_resistor_tab(self, parent):
         frame = ttk.LabelFrame(parent, text="Resistors", padding=8)
@@ -522,7 +525,10 @@ Fin layout and fin heat transfer
 Use the heatsink dialog's Fin layout designer for individual fin positions and heights. Even fills the available width. Place fins near resistors clusters fins under/near heat sources along the fin spread axis. Thermal segments controls how finely each fin is split along its length for local heat-transfer calculation. Use auto unless you specifically need more detail. v14 also colors fins with a temperature gradient up their height using the fin equation, instead of coloring the whole fin uniformly.
 
 Resistor body/element temperatures
-The plate solver gives the local plate footprint temperature. v14 adds a resistor thermal stack: plate footprint → case/body → internal element. Enter Case→plate °C/W and Element→case °C/W from a datasheet if possible.
+The plate solver gives the local plate footprint temperature. v14+ adds a resistor thermal stack: plate footprint → case/body → internal element. Enter Case→plate °C/W and Element→case °C/W from a datasheet if possible.
+
+Performance
+v15.2 replaces the Matplotlib 3D viewer with a custom Tk Canvas engineering renderer. It projects the plate, fins, and resistors directly to 2D polygons, which is much faster for this fixed-geometry simulator than mplot3d.
 """.strip())
         t.configure(state="disabled")
 
@@ -876,6 +882,101 @@ The plate solver gives the local plate footprint temperature. v14 adds a resisto
             self.fig.subplots_adjust(left=.08,right=.96,bottom=.10,top=.92); self.canvas.draw_idle(); self.snapshot_label_var.set("Live preview"); self._current_snapshot_idx=None
         finally: self._drawing_snapshot=False
 
+    def _draw_fin_overlay_2d(self, ax, cfg):
+        """Draw fin footprints on top of the 2D heatmap."""
+        if not self.show_fin_overlay_2d_var.get():
+            return
+        try:
+            if not getattr(cfg, "heatsink_geometry_enabled", False):
+                return
+            for fin in heatsink_fin_specs(cfg):
+                fx = fin["center_x_cm"]
+                fy = fin["center_y_cm"]
+                fw = max(0.01, fin["footprint_x_cm"])
+                fh = max(0.01, fin["footprint_y_cm"])
+                ax.add_patch(
+                    Rectangle(
+                        (fx - fw / 2.0, fy - fh / 2.0),
+                        fw,
+                        fh,
+                        fill=False,
+                        linestyle="--",
+                        linewidth=1.0,
+                        alpha=0.75,
+                    )
+                )
+        except Exception:
+            pass
+
+    def _effective_3d_quality(self):
+        """Return (fin_segment_stride, height_slices) for the 3D viewer.
+
+        v15.1 changes the meaning:
+        - Full / batched: draws every fin segment using batched collections.
+        - Simplified: still available as an emergency mode for very old machines.
+        """
+        q = str(self.viewer_3d_quality_var.get()).lower()
+        if "simpl" in q:
+            return 3, 4
+        return 1, 8
+
+    def _box_faces_3d_translated(self, cx, cy, cz, sx, sy, sz):
+        """Return box faces; used for batch rendering many boxes in one collection."""
+        x0, x1 = cx - sx / 2.0, cx + sx / 2.0
+        y0, y1 = cy - sy / 2.0, cy + sy / 2.0
+        z0, z1 = cz - sz / 2.0, cz + sz / 2.0
+        v = [
+            (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+            (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+        ]
+        return [
+            [v[i] for i in [0, 1, 2, 3]],
+            [v[i] for i in [4, 5, 6, 7]],
+            [v[i] for i in [0, 1, 5, 4]],
+            [v[i] for i in [2, 3, 7, 6]],
+            [v[i] for i in [1, 2, 6, 5]],
+            [v[i] for i in [0, 3, 7, 4]],
+        ]
+
+    def _add_boxes_3d_batched(self, ax, boxes, edge_color=None, linewidth=0.0):
+        """Draw many boxes as one Poly3DCollection.
+
+        This is the main v15.1 performance fix. Matplotlib is slow when we add
+        hundreds/thousands of individual Poly3DCollection objects. One large
+        collection with many faces is far faster while preserving the same
+        visible geometry.
+        """
+        if not boxes:
+            return
+
+        faces = []
+        facecolors = []
+        edgecolors = []
+
+        for cx, cy, cz, sx, sy, sz, color, alpha in boxes:
+            rgba = list(color)
+            if len(rgba) < 4:
+                rgba.append(alpha)
+            else:
+                rgba[3] = alpha
+
+            box_faces = self._box_faces_3d_translated(cx, cy, cz, sx, sy, sz)
+            faces.extend(box_faces)
+            facecolors.extend([rgba] * len(box_faces))
+            if edge_color is None:
+                edgecolors.extend([rgba] * len(box_faces))
+            else:
+                edgecolors.extend([edge_color] * len(box_faces))
+
+        poly = Poly3DCollection(
+            faces,
+            facecolors=facecolors,
+            edgecolors=edgecolors,
+            linewidths=linewidth,
+            alpha=None,
+        )
+        ax.add_collection3d(poly)
+
     def _draw_snapshot(self, idx:int):
         if self.result is None: self._draw_layout_preview(); return
         if idx<0 or idx>=len(self.result.snapshots) or self._drawing_snapshot: return
@@ -886,6 +987,7 @@ The plate solver gives the local plate footprint temperature. v14 adds a resisto
             vmin,vmax=(self.vmin,self.vmax) if self.fixed_scale_var.get() and self.vmin is not None else (None,None)
             im=self.ax.imshow(temp.T,origin="lower",extent=[x[0],x[-1],y[0],y[-1]],aspect="equal",interpolation="bilinear",vmin=vmin,vmax=vmax)
             self.colorbar=self.fig.colorbar(im,ax=self.ax); self.colorbar.set_label("Temperature, °C")
+            self._draw_fin_overlay_2d(self.ax, cfg)
             for r in cfg.resistors:
                 l=r.length_mm/10; w=r.width_mm/10
                 self.ax.add_patch(Rectangle((r.center_x_cm-l/2,r.center_y_cm-w/2),l,w,fill=False,linewidth=2)); self.ax.text(r.center_x_cm,r.center_y_cm,r.name,ha="center",va="center",fontsize=9)
@@ -1185,9 +1287,17 @@ The plate solver gives the local plate footprint temperature. v14 adds a resisto
             ax.plot([a[0], b[0]], [a[1], b[1]], [a[2], b[2]], color=color, linewidth=linewidth)
 
     def _open_3d_viewer(self):
+        """Open the v15.2 canvas 3D viewer.
+
+        This intentionally does not use Matplotlib mplot3d. The old viewer was
+        bottlenecked by 3D artist creation/depth sorting. This viewer projects
+        the model onto a Tk Canvas and paints polygons directly, which is much
+        closer to what this simulator actually needs: fast engineering
+        visualization of a known geometry.
+        """
         win = tk.Toplevel(self)
-        win.title("3D heatmap viewer")
-        win.geometry("1100x820")
+        win.title("Fast 3D engineering viewer")
+        win.geometry("1180x820")
         win.transient(self)
 
         controls = ttk.Frame(win, padding=8)
@@ -1195,39 +1305,269 @@ The plate solver gives the local plate footprint temperature. v14 adds a resisto
 
         show_fins = tk.BooleanVar(value=True)
         show_res = tk.BooleanVar(value=True)
-        show_res_edges = tk.BooleanVar(value=True)
-        transparent_plate = tk.BooleanVar(value=True)
+        show_plate_heat = tk.BooleanVar(value=True)
+        transparent_plate = tk.BooleanVar(value=False)
         exploded_view = tk.BooleanVar(value=True)
-        heat_both = tk.BooleanVar(value=False)
+        show_edges = tk.BooleanVar(value=True)
 
         side_var = tk.StringVar(value=self.resistor_side_var.get())
         view_var = tk.StringVar(value="Isometric")
         snap_var = tk.IntVar(value=int(round(float(self.time_slider.get()))) if self.result is not None else 0)
+        yaw_var = tk.DoubleVar(value=-45.0)
+        elev_var = tk.DoubleVar(value=35.0)
+        zoom_var = tk.DoubleVar(value=1.0)
 
+        ttk.Checkbutton(controls, text="Plate heat", variable=show_plate_heat).pack(side="left", padx=(0,8))
         ttk.Checkbutton(controls, text="Show fins", variable=show_fins).pack(side="left", padx=(0,8))
         ttk.Checkbutton(controls, text="Show resistors", variable=show_res).pack(side="left", padx=(0,8))
-        ttk.Checkbutton(controls, text="Resistor outlines", variable=show_res_edges).pack(side="left", padx=(0,8))
-        ttk.Checkbutton(controls, text="Transparent plate", variable=transparent_plate).pack(side="left", padx=(0,8))
-        ttk.Checkbutton(controls, text="Exploded view", variable=exploded_view).pack(side="left", padx=(0,8))
-        ttk.Checkbutton(controls, text="Heatmap both faces", variable=heat_both).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Edges", variable=show_edges).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Light plate", variable=transparent_plate).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Exploded", variable=exploded_view).pack(side="left", padx=(0,8))
 
         ttk.Label(controls, text="Resistors").pack(side="left")
-        ttk.Combobox(controls, textvariable=side_var, values=["Front / flat side","Back / fin side","Both sides"], state="readonly", width=16).pack(side="left", padx=(4,8))
-        ttk.Label(controls, text="View").pack(side="left")
-        ttk.Combobox(controls, textvariable=view_var, values=["Isometric","Front","Back","Side X","Side Y"], state="readonly", width=10).pack(side="left", padx=(4,8))
+        ttk.Combobox(
+            controls,
+            textvariable=side_var,
+            values=["Front / flat side", "Back / fin side", "Both sides"],
+            state="readonly",
+            width=16,
+        ).pack(side="left", padx=(4,8))
 
-        max_snap = len(self.result.snapshots)-1 if self.result is not None else 0
-        slider = ttk.Scale(controls, from_=0, to=max_snap, orient="horizontal", variable=snap_var)
-        slider.pack(side="left", fill="x", expand=True, padx=(8,4))
+        ttk.Label(controls, text="View").pack(side="left")
+        view_combo = ttk.Combobox(
+            controls,
+            textvariable=view_var,
+            values=["Isometric", "Top", "Front", "Back", "Side X", "Side Y"],
+            state="readonly",
+            width=10,
+        )
+        view_combo.pack(side="left", padx=(4,8))
 
         label_var = tk.StringVar(value="")
-        ttk.Label(controls, textvariable=label_var, width=30).pack(side="left")
+        ttk.Label(controls, textvariable=label_var, width=42).pack(side="right")
 
-        fig = Figure(figsize=(9,7), dpi=100)
-        canvas = FigureCanvasTkAgg(fig, master=win)
-        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-        tb = NavigationToolbar2Tk(canvas, win)
-        tb.update()
+        sliders = ttk.Frame(win, padding=(8, 0, 8, 6))
+        sliders.pack(side="top", fill="x")
+
+        max_snap = len(self.result.snapshots)-1 if self.result is not None else 0
+        ttk.Label(sliders, text="Time").grid(row=0, column=0, sticky="w")
+        time_slider = ttk.Scale(sliders, from_=0, to=max_snap, orient="horizontal", variable=snap_var)
+        time_slider.grid(row=0, column=1, sticky="ew", padx=(6,12))
+
+        ttk.Label(sliders, text="Yaw").grid(row=0, column=2, sticky="w")
+        yaw_slider = ttk.Scale(sliders, from_=-180, to=180, orient="horizontal", variable=yaw_var)
+        yaw_slider.grid(row=0, column=3, sticky="ew", padx=(6,12))
+
+        ttk.Label(sliders, text="Elev").grid(row=0, column=4, sticky="w")
+        elev_slider = ttk.Scale(sliders, from_=5, to=89, orient="horizontal", variable=elev_var)
+        elev_slider.grid(row=0, column=5, sticky="ew", padx=(6,12))
+
+        ttk.Label(sliders, text="Zoom").grid(row=0, column=6, sticky="w")
+        zoom_slider = ttk.Scale(sliders, from_=0.35, to=2.5, orient="horizontal", variable=zoom_var)
+        zoom_slider.grid(row=0, column=7, sticky="ew", padx=(6,0))
+
+        for col in (1, 3, 5, 7):
+            sliders.columnconfigure(col, weight=1)
+
+        canvas_frame = ttk.Frame(win)
+        canvas_frame.pack(side="top", fill="both", expand=True)
+
+        cnv = tk.Canvas(canvas_frame, background="white", highlightthickness=0)
+        cnv.pack(side="left", fill="both", expand=True)
+
+        info = tk.Text(canvas_frame, width=30, wrap="word")
+        info.pack(side="right", fill="y")
+        info.insert(
+            "end",
+            """v15.2 renderer
+
+This viewer uses a custom Tk Canvas projection instead of Matplotlib mplot3d.
+
+It keeps fin segment/detail geometry, but draws it as direct 2D polygons.
+That is much faster for this kind of engineering view.
+
+Use mouse drag to rotate.
+Mouse wheel zooms.
+Time slider follows simulation snapshots.
+""",
+        )
+        info.configure(state="disabled")
+
+        state = {"drag_x": None, "drag_y": None, "last_draw": 0.0}
+
+        def rgba_to_hex(rgba, lighten=0.0):
+            r, g, b = float(rgba[0]), float(rgba[1]), float(rgba[2])
+            if lighten:
+                r = r * (1.0 - lighten) + lighten
+                g = g * (1.0 - lighten) + lighten
+                b = b * (1.0 - lighten) + lighten
+            r = max(0, min(255, int(round(r * 255))))
+            g = max(0, min(255, int(round(g * 255))))
+            b = max(0, min(255, int(round(b * 255))))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        def temp_color(temp_value, cmap, norm, lighten=0.0):
+            return rgba_to_hex(cmap(norm(float(temp_value))), lighten=lighten)
+
+        def edges_from_centers(vals):
+            vals = np.asarray(vals, dtype=float)
+            if len(vals) == 1:
+                return np.array([vals[0] - 0.5, vals[0] + 0.5])
+            mids = (vals[:-1] + vals[1:]) / 2.0
+            first = vals[0] - (mids[0] - vals[0])
+            last = vals[-1] + (vals[-1] - mids[-1])
+            return np.concatenate([[first], mids, [last]])
+
+        def project_point(p, yaw_deg, elev_deg, scale, cx, cy):
+            x, y, z = p
+            yaw = math.radians(yaw_deg)
+            elev = math.radians(elev_deg)
+
+            # Rotate in plate plane.
+            x1 = x * math.cos(yaw) - y * math.sin(yaw)
+            y1 = x * math.sin(yaw) + y * math.cos(yaw)
+
+            # Orthographic camera elevation. elev=90 is top-down.
+            screen_x = cx + x1 * scale
+            screen_y = cy - (y1 * math.sin(elev) + z * math.cos(elev)) * scale
+
+            # Larger depth is closer to viewer.
+            depth = y1 * math.cos(elev) - z * math.sin(elev)
+            return screen_x, screen_y, depth
+
+        def box_faces(cx, cy, cz, sx, sy, sz):
+            x0, x1 = cx - sx / 2.0, cx + sx / 2.0
+            y0, y1 = cy - sy / 2.0, cy + sy / 2.0
+            z0, z1 = cz - sz / 2.0, cz + sz / 2.0
+            v = [
+                (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+            ]
+            return [
+                [v[i] for i in (0,1,2,3)],
+                [v[i] for i in (4,5,6,7)],
+                [v[i] for i in (0,1,5,4)],
+                [v[i] for i in (1,2,6,5)],
+                [v[i] for i in (2,3,7,6)],
+                [v[i] for i in (3,0,4,7)],
+            ]
+
+        def add_box(objects, cx, cy, cz, sx, sy, sz, fill, outline=""):
+            for face in box_faces(cx, cy, cz, sx, sy, sz):
+                objects.append({
+                    "kind": "poly",
+                    "points": face,
+                    "fill": fill,
+                    "outline": outline,
+                    "width": 1 if outline else 0,
+                })
+
+        def add_plate_heatmap(objects, cfg, x_cm, y_cm, temp, cmap, norm):
+            x_edges = edges_from_centers(x_cm)
+            y_edges = edges_from_centers(y_cm)
+
+            # Drawing every solver cell is usually fine, but very high grids can
+            # create tens of thousands of canvas polygons. Cap display cells; the
+            # 2D heatmap remains the precise view for the temperature field.
+            max_cells_axis = 75
+            sx = max(1, int(math.ceil(len(x_cm) / max_cells_axis)))
+            sy = max(1, int(math.ceil(len(y_cm) / max_cells_axis)))
+
+            lighten = 0.32 if transparent_plate.get() else 0.0
+
+            for ix in range(0, len(x_cm), sx):
+                ix2 = min(len(x_cm), ix + sx)
+                for iy in range(0, len(y_cm), sy):
+                    iy2 = min(len(y_cm), iy + sy)
+                    tval = float(np.mean(temp[ix:ix2, iy:iy2]))
+                    fill = temp_color(tval, cmap, norm, lighten=lighten)
+                    face = [
+                        (float(x_edges[ix]),  float(y_edges[iy]),  0.0),
+                        (float(x_edges[ix2]), float(y_edges[iy]),  0.0),
+                        (float(x_edges[ix2]), float(y_edges[iy2]), 0.0),
+                        (float(x_edges[ix]),  float(y_edges[iy2]), 0.0),
+                    ]
+                    objects.append({"kind": "poly", "points": face, "fill": fill, "outline": "", "width": 0})
+
+        def add_fins(objects, cfg, x_cm, y_cm, temp, cmap, norm):
+            t_cm = max(0.02, cfg.plate_thickness_mm / 10.0)
+            fin_segments = heatsink_fin_segment_specs(cfg)
+            height_slices = 8
+
+            for fin in fin_segments:
+                fx = fin["center_x_cm"]
+                fy = fin["center_y_cm"]
+                fw = max(0.02, fin["footprint_x_cm"])
+                fr = max(0.02, fin["footprint_y_cm"])
+                fh = max(0.02, fin["height_mm"] / 10.0)
+
+                base_tc = self._temp_nearest_3d(fx, fy, x_cm, y_cm, temp)
+                dz = fh / height_slices
+
+                for zi in range(height_slices):
+                    frac = (zi + 0.5) / height_slices
+                    fin_tc = fin_temperature_at_height(cfg, fin, base_tc, frac)
+                    zc = -t_cm - dz * (zi + 0.5)
+                    fill = temp_color(fin_tc, cmap, norm)
+                    add_box(objects, fx, fy, zc, fw, fr, dz, fill, "")
+
+        def add_resistors(objects, labels, cfg, x_cm, y_cm, temp, cmap, norm):
+            t_cm = max(0.02, cfg.plate_thickness_mm / 10.0)
+            side = side_var.get()
+            explode_gap = 0.72 if exploded_view.get() else 0.0
+            z_sides = []
+
+            if side in ("Front / flat side", "Both sides"):
+                z_sides.append((0.28 + explode_gap, 1))
+            if side in ("Back / fin side", "Both sides"):
+                z_sides.append((-t_cm - 0.28 - explode_gap, -1))
+
+            for r in cfg.resistors:
+                sx = max(0.03, r.length_mm / 10.0)
+                sy = max(0.03, r.width_mm / 10.0)
+                sz = 0.55
+                tc = self._temp_nearest_3d(r.center_x_cm, r.center_y_cm, x_cm, y_cm, temp)
+                case_tc = tc + r.power_w * max(0.0, float(getattr(cfg, "resistor_case_to_plate_cw", 0.5)))
+                fill = temp_color(case_tc, cmap, norm)
+                outline = "black" if show_edges.get() else ""
+
+                for zc, sign in z_sides:
+                    add_box(objects, r.center_x_cm, r.center_y_cm, zc, sx, sy, sz, fill, outline)
+                    labels.append((r.center_x_cm, r.center_y_cm, zc + sign * 0.45, r.name))
+
+        def draw_colorbar(cnv, cmap, norm, width, height):
+            bar_w = 18
+            x0 = width - 70
+            y0 = 70
+            bar_h = max(120, min(300, height - 180))
+            steps = 80
+            for i in range(steps):
+                frac0 = i / steps
+                frac1 = (i + 1) / steps
+                value = norm.vmax - frac0 * (norm.vmax - norm.vmin)
+                fill = temp_color(value, cmap, norm)
+                ya = y0 + frac0 * bar_h
+                yb = y0 + frac1 * bar_h
+                cnv.create_rectangle(x0, ya, x0 + bar_w, yb, outline="", fill=fill)
+            cnv.create_rectangle(x0, y0, x0 + bar_w, y0 + bar_h, outline="black")
+            cnv.create_text(x0 + bar_w + 5, y0, anchor="w", text=f"{norm.vmax:.1f}°C", font=("TkDefaultFont", 8))
+            cnv.create_text(x0 + bar_w + 5, y0 + bar_h, anchor="w", text=f"{norm.vmin:.1f}°C", font=("TkDefaultFont", 8))
+
+        def apply_view_preset(*_):
+            view = view_var.get()
+            if view == "Top":
+                yaw_var.set(0.0); elev_var.set(89.0)
+            elif view == "Front":
+                yaw_var.set(0.0); elev_var.set(20.0)
+            elif view == "Back":
+                yaw_var.set(180.0); elev_var.set(20.0)
+            elif view == "Side X":
+                yaw_var.set(90.0); elev_var.set(20.0)
+            elif view == "Side Y":
+                yaw_var.set(0.0); elev_var.set(20.0)
+            else:
+                yaw_var.set(-45.0); elev_var.set(35.0)
+            draw()
 
         def draw(*_):
             try:
@@ -1236,121 +1576,145 @@ The plate solver gives the local plate footprint temperature. v14 adds a resisto
                     idx = max(0, min(len(self.result.snapshots)-1, int(round(float(snap_var.get())))))
                     snap = self.result.snapshots[idx]
                     cfg = self.result.cfg
-                    x_cm = self.result.x_m*100.0
-                    y_cm = self.result.y_m*100.0
+                    x_cm = self.result.x_m * 100.0
+                    y_cm = self.result.y_m * 100.0
                     temp = snap.temp_c
                     label = snap.label
 
-                fig.clear()
-                ax3 = fig.add_subplot(111, projection="3d")
-                X, Y = np.meshgrid(x_cm, y_cm, indexing="ij")
+                width = max(100, cnv.winfo_width())
+                height = max(100, cnv.winfo_height())
+                cnv.delete("all")
 
-                t_cm = max(0.02, cfg.plate_thickness_mm/10.0)
                 cmap = self._heatmap_cmap()
                 vmin, vmax = self._heatmap_norm_limits_for_temp(temp)
                 norm = Normalize(vmin=vmin, vmax=vmax)
 
-                plate_alpha = 0.48 if transparent_plate.get() else 1.0
-                colors = cmap(norm(temp))
-                colors[..., 3] = plate_alpha
-
-                ax3.plot_surface(X, Y, np.zeros_like(X), facecolors=colors, shade=False, linewidth=0, antialiased=False, alpha=plate_alpha)
-
-                if heat_both.get() or transparent_plate.get():
-                    back_colors = colors.copy()
-                    back_colors[..., 3] = 0.38 if transparent_plate.get() else 0.85
-                    ax3.plot_surface(X, Y, np.full_like(X, -t_cm), facecolors=back_colors, shade=False, linewidth=0, antialiased=False, alpha=float(back_colors[..., 3].mean()))
-
-                # v14: draw fin thermal segments with a height temperature gradient.
-                # The base uses local plate temperature. Upper slices use the
-                # same straight-fin model used by fin efficiency.
-                if show_fins.get():
-                    for fin in heatsink_fin_segment_specs(cfg):
-                        fx = fin["center_x_cm"]
-                        fy = fin["center_y_cm"]
-                        fw = max(0.02, fin["footprint_x_cm"])
-                        fr = max(0.02, fin["footprint_y_cm"])
-                        fh = max(0.02, fin["height_mm"]/10.0)
-                        base_tc = self._temp_nearest_3d(fx, fy, x_cm, y_cm, temp)
-                        height_slices = 8
-                        dz = fh / height_slices
-                        for zi in range(height_slices):
-                            frac = (zi + 0.5) / height_slices
-                            fin_tc = fin_temperature_at_height(cfg, fin, base_tc, frac)
-                            zc = -t_cm - dz * (zi + 0.5)
-                            self._add_box_3d(ax3, fx, fy, zc, fw, fr, dz, cmap(norm(fin_tc)), alpha=0.72, edge=False)
-
-                resistor_edge_boxes = []
-                if show_res.get():
-                    z_sides = []
-                    side = side_var.get()
-                    explode_gap = 0.72 if exploded_view.get() else 0.0
-                    if side in ("Front / flat side","Both sides"):
-                        z_sides.append((0.28 + explode_gap, 1))
-                    if side in ("Back / fin side","Both sides"):
-                        z_sides.append((-t_cm - 0.28 - explode_gap, -1))
-
-                    for r in cfg.resistors:
-                        sx = max(0.03, r.length_mm/10.0)
-                        sy = max(0.03, r.width_mm/10.0)
-                        sz = 0.55
-                        tc = self._temp_nearest_3d(r.center_x_cm, r.center_y_cm, x_cm, y_cm, temp)
-                        case_tc = tc + r.power_w * max(0.0, float(getattr(cfg, "resistor_case_to_plate_cw", 0.5)))
-                        col = cmap(norm(case_tc))
-                        for zc, sign in z_sides:
-                            self._add_box_3d(ax3, r.center_x_cm, r.center_y_cm, zc, sx, sy, sz, col, alpha=0.96)
-                            resistor_edge_boxes.append((r.center_x_cm, r.center_y_cm, zc, sx, sy, sz))
-                            ax3.text(r.center_x_cm, r.center_y_cm, zc + sign*0.45, r.name, ha="center", va="center", fontsize=8, color="black")
-
-                if show_res.get() and show_res_edges.get():
-                    for args in resistor_edge_boxes:
-                        self._add_box_edges_3d(ax3, *args, color="black", linewidth=0.95)
-
-                mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
-                mappable.set_array(temp)
-                fig.colorbar(mappable, ax=ax3, shrink=0.70, pad=0.02, label="Temperature, °C")
-
                 maxx = max(abs(float(x_cm[0])), abs(float(x_cm[-1])), 1.0)
                 maxy = max(abs(float(y_cm[0])), abs(float(y_cm[-1])), 1.0)
-                max_fin_h = max([fin.get("height_mm",0)/10.0 for fin in heatsink_fin_specs(cfg)] + [1.0])
-                extra = 0.9 if exploded_view.get() else 0.2
-                zmin = -t_cm - max_fin_h - extra - 0.8
-                zmax = 1.2 + extra
+                max_fin_h = max([fin.get("height_mm", 0) / 10.0 for fin in heatsink_fin_specs(cfg)] + [1.0])
+                geom_span = max(2 * maxx, 2 * maxy, max_fin_h + 4.0)
+                scale = 0.78 * min(width - 120, height - 40) / max(1.0, geom_span) * float(zoom_var.get())
+                cx = width * 0.48
+                cy = height * 0.52
 
-                ax3.set_xlim(-maxx, maxx)
-                ax3.set_ylim(-maxy, maxy)
-                ax3.set_zlim(zmin, zmax)
-                ax3.set_xlabel("x / width cm")
-                ax3.set_ylabel("y / height cm")
-                ax3.set_zlabel("z cm")
-                ax3.set_title(f"3D heatmap: {label}")
-                try:
-                    ax3.set_box_aspect((2*maxx,2*maxy,max(1.0,zmax-zmin)))
-                except Exception:
-                    pass
+                objects = []
+                labels = []
 
-                view = view_var.get()
-                if view=="Front":
-                    ax3.view_init(elev=80,azim=-90)
-                elif view=="Back":
-                    ax3.view_init(elev=-75,azim=-90)
-                elif view=="Side X":
-                    ax3.view_init(elev=12,azim=0)
-                elif view=="Side Y":
-                    ax3.view_init(elev=12,azim=90)
-                else:
-                    ax3.view_init(elev=28,azim=-55)
+                if show_plate_heat.get():
+                    add_plate_heatmap(objects, cfg, x_cm, y_cm, temp, cmap, norm)
 
-                label_var.set(f"{label} | fin segs: {len(heatsink_fin_segment_specs(cfg))}")
-                fig.subplots_adjust(left=0.02,right=0.90,bottom=0.02,top=0.94)
-                canvas.draw_idle()
+                if show_fins.get():
+                    add_fins(objects, cfg, x_cm, y_cm, temp, cmap, norm)
+
+                if show_res.get():
+                    add_resistors(objects, labels, cfg, x_cm, y_cm, temp, cmap, norm)
+
+                yaw = float(yaw_var.get())
+                elev = float(elev_var.get())
+
+                rendered = []
+                for obj in objects:
+                    pts = [project_point(p, yaw, elev, scale, cx, cy) for p in obj["points"]]
+                    coords = []
+                    for sx, sy, _depth in pts:
+                        coords.extend([sx, sy])
+                    depth = sum(p[2] for p in pts) / max(1, len(pts))
+                    rendered.append((depth, coords, obj))
+
+                # Painter sort: far to near.
+                rendered.sort(key=lambda item: item[0])
+
+                for _depth, coords, obj in rendered:
+                    cnv.create_polygon(
+                        coords,
+                        fill=obj["fill"],
+                        outline=obj["outline"],
+                        width=obj.get("width", 0),
+                    )
+
+                # Draw labels last.
+                for lx, ly, lz, txt in labels:
+                    sx, sy, _d = project_point((lx, ly, lz), yaw, elev, scale, cx, cy)
+                    cnv.create_text(sx, sy, text=txt, fill="black", font=("TkDefaultFont", 8, "bold"))
+
+                # Simple axes / orientation cross.
+                origin = project_point((0,0,0), yaw, elev, scale, cx, cy)
+                axx = project_point((min(5, maxx),0,0), yaw, elev, scale, cx, cy)
+                axy = project_point((0,min(5, maxy),0), yaw, elev, scale, cx, cy)
+                axz = project_point((0,0,min(3, max_fin_h)), yaw, elev, scale, cx, cy)
+                cnv.create_line(origin[0], origin[1], axx[0], axx[1], fill="#333", width=2)
+                cnv.create_line(origin[0], origin[1], axy[0], axy[1], fill="#333", width=2)
+                cnv.create_line(origin[0], origin[1], axz[0], axz[1], fill="#333", width=2)
+                cnv.create_text(axx[0], axx[1], text="x", fill="#333")
+                cnv.create_text(axy[0], axy[1], text="y", fill="#333")
+                cnv.create_text(axz[0], axz[1], text="z", fill="#333")
+
+                draw_colorbar(cnv, cmap, norm, width, height)
+
+                fin_seg_count = len(heatsink_fin_segment_specs(cfg))
+                label_var.set(f"{label} | Canvas renderer | fin segs: {fin_seg_count} | objects: {len(rendered)}")
             except Exception as e:
                 label_var.set(f"3D error: {e}")
 
-        for var in (show_fins, show_res, show_res_edges, heat_both, transparent_plate, exploded_view, side_var, view_var):
-            var.trace_add("write", lambda *a: draw())
-        slider.configure(command=lambda v: draw())
-        draw()
+        def throttled_draw(*_):
+            # Tk Canvas redraws are cheap, but sliders can fire very rapidly.
+            # This coalesces bursts into one redraw per event loop cycle.
+            if state.get("pending"):
+                return
+            state["pending"] = True
+            def run():
+                state["pending"] = False
+                draw()
+            win.after_idle(run)
+
+        def on_press(event):
+            state["drag_x"] = event.x
+            state["drag_y"] = event.y
+
+        def on_drag(event):
+            if state["drag_x"] is None:
+                return
+            dx = event.x - state["drag_x"]
+            dy = event.y - state["drag_y"]
+            state["drag_x"] = event.x
+            state["drag_y"] = event.y
+            yaw_var.set(float(yaw_var.get()) + dx * 0.45)
+            elev_var.set(max(5.0, min(89.0, float(elev_var.get()) - dy * 0.35)))
+            throttled_draw()
+
+        def on_release(event):
+            state["drag_x"] = None
+            state["drag_y"] = None
+
+        def on_wheel(event):
+            delta = 1 if getattr(event, "delta", 0) > 0 else -1
+            if getattr(event, "num", None) == 4:
+                delta = 1
+            elif getattr(event, "num", None) == 5:
+                delta = -1
+            zoom = float(zoom_var.get()) * (1.10 if delta > 0 else 0.90)
+            zoom_var.set(max(0.35, min(2.5, zoom)))
+            throttled_draw()
+
+        for var in (show_fins, show_res, show_plate_heat, transparent_plate, exploded_view, show_edges, side_var, yaw_var, elev_var, zoom_var, snap_var):
+            var.trace_add("write", lambda *a: throttled_draw())
+
+        view_var.trace_add("write", apply_view_preset)
+        time_slider.configure(command=lambda v: throttled_draw())
+        yaw_slider.configure(command=lambda v: throttled_draw())
+        elev_slider.configure(command=lambda v: throttled_draw())
+        zoom_slider.configure(command=lambda v: throttled_draw())
+
+        cnv.bind("<ButtonPress-1>", on_press)
+        cnv.bind("<B1-Motion>", on_drag)
+        cnv.bind("<ButtonRelease-1>", on_release)
+        cnv.bind("<MouseWheel>", on_wheel)
+        cnv.bind("<Button-4>", on_wheel)
+        cnv.bind("<Button-5>", on_wheel)
+        cnv.bind("<Configure>", lambda e: throttled_draw())
+
+        apply_view_preset()
+
 
     def _fin_count_int(self):
         return max(0, int(round(parse_float(self.heatsink_fin_count_var.get(), "Fin count", 0))))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v14_gui.py
+thermal_plate_sim_v15_2_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v14_gui.py
+  python3 thermal_plate_sim_v15_2_gui.py
 """
 
 from __future__ import annotations
@@ -465,11 +465,13 @@ def _auto_fin_segment_count(cfg: "PlateConfig", spec: Dict, dx_m=None, dy_m=None
 
     if dx_m is not None and dy_m is not None:
         run_cell_cm = (dy_m if orientation == "run_y" else dx_m) * 100.0
-        target_cm = max(0.8, min(3.0, run_cell_cm * 2.0))
+        # v15: slightly coarser default than v14. It is much faster and still
+        # usually finer than the thermal grid itself.
+        target_cm = max(1.2, min(5.0, run_cell_cm * 3.0))
     else:
-        target_cm = 2.0
+        target_cm = 3.0
 
-    return max(1, min(120, int(math.ceil(run_cm / target_cm))))
+    return max(1, min(80, int(math.ceil(run_cm / target_cm))))
 
 
 def heatsink_fin_segment_specs(cfg: "PlateConfig", dx_m=None, dy_m=None) -> List[Dict]:
@@ -603,27 +605,34 @@ def cooling_loss_coeff_map(cfg: "PlateConfig", shape: Tuple[int, int], dx_m: flo
     X, Y = np.meshgrid(x, y, indexing="ij")
     cell_area = dx_m * dy_m
 
-    # v12: apply fin cooling in local run-length segments instead of one
-    # low-resolution full-fin strip. Total fin conductance is conserved.
+    # v15 performance:
+    # Apply fin cooling using index slices rather than building a full boolean
+    # mask for every fin segment. This is much faster when many fins/segments
+    # are present and gives the same local-cooling behavior.
     for spec in heatsink_fin_segment_specs(cfg, dx_m=dx_m, dy_m=dy_m):
         cx = spec["center_x_cm"] / 100.0
         cy = spec["center_y_cm"] / 100.0
         hx = (spec["footprint_x_cm"] / 100.0) / 2.0
         hy = (spec["footprint_y_cm"] / 100.0) / 2.0
-        mask = (X >= cx - hx) & (X <= cx + hx) & (Y >= cy - hy) & (Y <= cy + hy)
-        if not np.any(mask):
-            ix = int(np.argmin(np.abs(x - cx)))
-            iy = int(np.argmin(np.abs(y - cy)))
-            mask[ix, iy] = True
 
-        covered_area = float(np.count_nonzero(mask) * cell_area)
+        ix0 = int(np.searchsorted(x, cx - hx, side="left"))
+        ix1 = int(np.searchsorted(x, cx + hx, side="right"))
+        iy0 = int(np.searchsorted(y, cy - hy, side="left"))
+        iy1 = int(np.searchsorted(y, cy + hy, side="right"))
+
+        ix0 = max(0, min(len(x) - 1, ix0))
+        ix1 = max(ix0 + 1, min(len(x), ix1))
+        iy0 = max(0, min(len(y) - 1, iy0))
+        iy1 = max(iy0 + 1, min(len(y), iy1))
+
+        covered_area = float((ix1 - ix0) * (iy1 - iy0) * cell_area)
         eta = float(spec.get("full_fin_efficiency", fin_efficiency_for_spec(cfg, spec)))
         fin_conductance_w_k = base_h * eta * spec["raw_area_m2"]
 
         # Base map already counted the back face under the fin. That area is
         # replaced by fin conductance.
         add_coeff = fin_conductance_w_k / max(1e-12, covered_area) - base_h
-        loss[mask] += add_coeff
+        loss[ix0:ix1, iy0:iy1] += add_coeff
 
     return np.maximum(loss, 0.0)
 
