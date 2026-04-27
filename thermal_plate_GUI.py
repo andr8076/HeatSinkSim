@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v9_gui.py
+thermal_plate_sim_v10_gui.py
 
-A cleaner tabbed UI for the thermal plate simulator with geometry heatsink builder and multi-worker optimization.
+Cross-platform thermal plate simulator with geometry heatsink builder and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
 
 Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v9_gui.py
+    python thermal_plate_sim_v10_gui.py
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
+import platform
 import queue
+import sys
 import threading
 import traceback
+
+# macOS: silence Tk deprecation noise on some Python/Tk combinations.
+# This must be set before importing tkinter.
+if sys.platform == "darwin":
+    os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+
 import tkinter as tk
 from dataclasses import asdict
 from pathlib import Path
@@ -27,7 +36,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
-matplotlib.use("TkAgg")
+matplotlib.use("TkAgg", force=True)
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
@@ -63,9 +72,17 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v9")
-        self.geometry("1320x840")
-        self.minsize(1120, 720)
+        self.title("Thermal Plate Simulator v10")
+
+        # Cross-platform initial window sizing.
+        # macOS laptops and smaller Linux/Windows screens can be shorter than
+        # the old fixed 1320x840 window.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = max(1000, min(1320, screen_w - 80))
+        win_h = max(680, min(840, screen_h - 110))
+        self.geometry(f"{win_w}x{win_h}")
+        self.minsize(min(1000, win_w), min(680, win_h))
 
         self.resistors: List[Resistor] = [Resistor("R1", 50.0, 0.0, 0.0, 50.0, 20.0)]
         self.result: Optional[SimulationResult] = None
@@ -92,7 +109,74 @@ class ThermalPlateGUI(tk.Tk):
         self._setup_traces()
         self._live_preview_ready = True
         self._draw_layout_preview()
+        self._install_cross_platform_shortcuts()
+        self._install_native_menu()
         self.after(100, self._poll_queue)
+
+    def _mousewheel_units(self, event) -> int:
+        """Return scroll units for Windows/macOS/Linux Tk mouse wheel events."""
+        # Linux/X11 usually sends Button-4/Button-5 instead of MouseWheel.
+        num = getattr(event, "num", None)
+        if num == 4:
+            return -3
+        if num == 5:
+            return 3
+
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return 0
+
+        if sys.platform == "darwin":
+            # macOS trackpads often send small deltas. Preserve direction and
+            # avoid int(delta / 120) becoming zero.
+            return -1 if delta > 0 else 1
+
+        # Windows usually sends +/-120 per wheel notch.
+        units = int(-delta / 120)
+        if units == 0:
+            units = -1 if delta > 0 else 1
+        return units
+
+    def _install_cross_platform_shortcuts(self):
+        """Keyboard shortcuts with Ctrl on Windows/Linux and Command on macOS."""
+        mod = "Command" if sys.platform == "darwin" else "Control"
+        self.bind_all(f"<{mod}-s>", lambda e: (self._save_config(), "break"))
+        self.bind_all(f"<{mod}-o>", lambda e: (self._load_config(), "break"))
+        self.bind_all(f"<{mod}-r>", lambda e: (self._start_simulation(), "break"))
+        self.bind_all("<Escape>", lambda e: (self._cancel_simulation(), "break"))
+
+    def _install_native_menu(self):
+        """Small native menu bar. Especially useful on macOS."""
+        try:
+            menubar = tk.Menu(self)
+
+            file_menu = tk.Menu(menubar, tearoff=False)
+            file_menu.add_command(label="Run Simulation", command=self._start_simulation)
+            file_menu.add_separator()
+            file_menu.add_command(label="Save Config...", command=self._save_config)
+            file_menu.add_command(label="Load Config...", command=self._load_config)
+            file_menu.add_separator()
+            file_menu.add_command(label="Export Heatmap...", command=self._export_image)
+            file_menu.add_command(label="Export CSV...", command=self._export_csv)
+            file_menu.add_separator()
+            file_menu.add_command(label="Quit", command=self.destroy)
+            menubar.add_cascade(label="File", menu=file_menu)
+
+            help_menu = tk.Menu(menubar, tearoff=False)
+            help_menu.add_command(
+                label="About",
+                command=lambda: messagebox.showinfo(
+                    "Thermal Plate Simulator v10",
+                    "Thermal Plate Simulator v10\nCross-platform GUI for Windows, macOS, and Linux."
+                )
+            )
+            menubar.add_cascade(label="Help", menu=help_menu)
+
+            self.config(menu=menubar)
+        except Exception:
+            # Menus are convenience only; never block the simulator if a Tk
+            # build handles menus differently.
+            pass
 
     # ----------------------------- variables -----------------------------
     def _create_vars(self):
@@ -213,20 +297,45 @@ class ThermalPlateGUI(tk.Tk):
         self.tabs.add(outer, text=title)
         outer.rowconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
+
         canvas = tk.Canvas(outer, width=420, highlightthickness=0)
         canvas.grid(row=0, column=0, sticky="ns")
         sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         sb.grid(row=0, column=1, sticky="ns")
         canvas.configure(yscrollcommand=sb.set)
+
         inner = ttk.Frame(canvas, padding=8)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
-        def wheel(e): canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        def enter(e): canvas.bind_all("<MouseWheel>", wheel)
-        def leave(e): canvas.unbind_all("<MouseWheel>")
-        canvas.bind("<Enter>", enter)
-        canvas.bind("<Leave>", leave)
+
+        def update_scrollregion(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_width(event=None):
+            canvas.itemconfigure(win, width=canvas.winfo_width())
+
+        def on_wheel(event):
+            units = self._mousewheel_units(event)
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        def bind_wheel(event=None):
+            # Use bind_all while hovering so the wheel still works when the
+            # pointer is over entries/buttons inside the tab.
+            canvas.bind_all("<MouseWheel>", on_wheel)
+            canvas.bind_all("<Button-4>", on_wheel)
+            canvas.bind_all("<Button-5>", on_wheel)
+
+        def unbind_wheel(event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        inner.bind("<Configure>", update_scrollregion)
+        canvas.bind("<Configure>", fit_width)
+        canvas.bind("<Enter>", bind_wheel)
+        canvas.bind("<Leave>", unbind_wheel)
+
         inner.columnconfigure(0, weight=1)
         return inner
 

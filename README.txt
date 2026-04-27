@@ -1,26 +1,104 @@
-Thermal Plate Simulator v9
+Thermal Plate Simulator v10
+===========================
 
-Run:
-    python thermal_plate_sim_v9_gui.py
+This package is intended to run on:
 
-Install dependencies if needed:
-    python -m pip install numpy matplotlib
+- Windows
+- macOS
+- Linux
 
-Files:
-    thermal_plate_sim_v9_gui.py
-    thermal_core.py
+Main files
+----------
 
-v9 adds a geometry-based heatsink builder:
-- fins are actual strips on the back side of the plate
-- resistors are assumed to mount on the flat/front side
-- fin count, orientation, thickness, run length, positions, and individual heights can be entered
-- default placement is even
-- fin thickness can be 'same' to use the base plate thickness
-- run length can be 'full'
-- positions can be 'even' or comma-separated center positions in cm
-- heights can be 'same' or comma-separated mm values
-- fin surface area and fin efficiency are calculated from dimensions
-- fin cooling is applied locally under each fin footprint, so placement affects the heatmap
+- run_thermal_sim.py              Cross-platform launcher
+- thermal_plate_sim_v10_gui.py    GUI
+- thermal_core.py                 Simulation engine
+- requirements.txt                Python dependencies
 
-Important:
-The dimensions and fin efficiency are calculated, but passive airflow h is still an environmental input. For real safety, test with a temperature sensor and use a cutoff.
+Quick start
+-----------
+
+Windows PowerShell:
+
+    py -3 run_thermal_sim.py
+
+or double-click:
+
+    run_windows.bat
+
+
+macOS Terminal:
+
+    python3 run_thermal_sim.py
+
+or double-click:
+
+    run_macos.command
+
+If macOS blocks the .command file, right-click it and choose Open. You can also run:
+
+    chmod +x run_macos.command
+    ./run_macos.command
+
+
+Linux Terminal:
+
+    python3 run_thermal_sim.py
+
+or:
+
+    ./run_linux.sh
+
+
+Dependencies
+------------
+
+The launcher checks for NumPy and Matplotlib and can offer to install them.
+
+Manual install:
+
+    python -m pip install -r requirements.txt
+
+On macOS:
+
+    python3 -m pip install -r requirements.txt
+
+Python from python.org is usually the simplest option on macOS because it includes a compatible Tkinter/Tk GUI stack.
+
+If you use Homebrew Python and Tkinter is missing, try:
+
+    brew install python-tk
+
+On Debian/Ubuntu/Linux Mint, if Tkinter is missing:
+
+    sudo apt install python3-tk
+
+On Fedora:
+
+    sudo dnf install python3-tkinter
+
+On Arch/EndeavourOS:
+
+    sudo pacman -S tk
+
+
+v10 cross-platform changes
+--------------------------
+
+- macOS Tk warning suppression.
+- Better initial window sizing for laptop screens.
+- Mouse wheel support for:
+  - Windows wheel
+  - macOS trackpad/wheel
+  - Linux/X11 Button-4/Button-5 scrolling
+- Native-ish menu bar with File/Help.
+- Keyboard shortcuts:
+  - macOS: Command-S save, Command-O load, Command-R run, Esc cancel
+  - Windows/Linux: Ctrl-S save, Ctrl-O load, Ctrl-R run, Esc cancel
+- Cross-platform launcher that checks Python, Tkinter, NumPy, and Matplotlib.
+
+
+Notes
+-----
+
+The simulator is still an engineering approximation. For real resistor dump hardware, use a temperature sensor, fuses, and thermal cutoff.
