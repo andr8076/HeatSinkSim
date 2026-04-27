@@ -708,7 +708,7 @@ class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v4")
+        self.title("Thermal Plate Simulator v4.1")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
@@ -720,6 +720,12 @@ class ThermalPlateGUI(tk.Tk):
         self.worker_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.msg_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+
+        # GUI redraw guards. Without these, Tk's slider callback can recursively
+        # trigger itself on some platforms, especially Windows/Python 3.12.
+        self._ignore_slider_callback = False
+        self._drawing_snapshot = False
+        self._current_snapshot_idx: Optional[int] = None
 
         self.vmin: Optional[float] = None
         self.vmax: Optional[float] = None
@@ -961,6 +967,7 @@ class ThermalPlateGUI(tk.Tk):
         self.ax.set_title("No simulation yet")
         self.ax.set_xlabel("x cm")
         self.ax.set_ylabel("y cm")
+        self.colorbar = None
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
@@ -1251,7 +1258,12 @@ class ThermalPlateGUI(tk.Tk):
 
         max_index = max(0, len(result.snapshots) - 1)
         self.time_slider.configure(from_=0, to=max_index)
-        self.time_slider.set(0)
+        self._ignore_slider_callback = True
+        try:
+            self.time_slider.set(0)
+        finally:
+            self._ignore_slider_callback = False
+        self._current_snapshot_idx = None
 
         self._write_summary(result)
         self._draw_snapshot(0)
@@ -1297,24 +1309,53 @@ class ThermalPlateGUI(tk.Tk):
         self._set_status("\n".join(lines))
 
     def _slider_changed(self, value):
+        """
+        Tk calls this continuously while the slider moves.
+
+        Important:
+        Do NOT call self.time_slider.set(...) from here. On some Tk builds,
+        setting the slider inside its own callback recursively fires the callback
+        again and can crash with RecursionError/TclError.
+        """
+        if self._ignore_slider_callback or self._drawing_snapshot:
+            return
         if self.result is None:
             return
-        idx = int(round(float(value)))
-        self.time_slider.set(idx)
+
+        try:
+            idx = int(round(float(value)))
+        except Exception:
+            return
+
+        idx = max(0, min(len(self.result.snapshots) - 1, idx))
+
+        # Avoid redrawing the same snapshot again and again while Tk sends
+        # repeated slider events.
+        if self._current_snapshot_idx == idx:
+            return
+
         self._draw_snapshot(idx)
 
     def _step_slider(self, delta: int):
         if self.result is None:
             return
+
         cur = int(round(float(self.time_slider.get())))
         new = max(0, min(len(self.result.snapshots) - 1, cur + delta))
-        self.time_slider.set(new)
+
+        self._ignore_slider_callback = True
+        try:
+            self.time_slider.set(new)
+        finally:
+            self._ignore_slider_callback = False
+
         self._draw_snapshot(new)
 
     def _redraw_current_snapshot(self):
         if self.result is None:
             return
         idx = int(round(float(self.time_slider.get())))
+        self._current_snapshot_idx = None
         self._draw_snapshot(idx)
 
     def _draw_snapshot(self, idx: int):
@@ -1322,76 +1363,84 @@ class ThermalPlateGUI(tk.Tk):
             return
         if idx < 0 or idx >= len(self.result.snapshots):
             return
+        if self._drawing_snapshot:
+            return
 
-        snap = self.result.snapshots[idx]
-        temp = snap.temp_c
-        cfg = self.result.cfg
-        x_cm = self.result.x_m * 100.0
-        y_cm = self.result.y_m * 100.0
+        self._drawing_snapshot = True
+        try:
+            snap = self.result.snapshots[idx]
+            temp = snap.temp_c
+            cfg = self.result.cfg
+            x_cm = self.result.x_m * 100.0
+            y_cm = self.result.y_m * 100.0
 
-        self.ax.clear()
+            # Fully rebuild the figure each time. This is a little less elegant
+            # than reusing axes, but it avoids Matplotlib colorbar/axis buildup
+            # and is much more stable on Windows.
+            self.fig.clear()
+            self.ax = self.fig.add_subplot(111)
+            self.colorbar = None
 
-        extent = [x_cm[0], x_cm[-1], y_cm[0], y_cm[-1]]
+            extent = [x_cm[0], x_cm[-1], y_cm[0], y_cm[-1]]
 
-        if self.fixed_scale_var.get() and self.vmin is not None and self.vmax is not None:
-            vmin = self.vmin
-            vmax = self.vmax
-        else:
-            vmin = None
-            vmax = None
+            if self.fixed_scale_var.get() and self.vmin is not None and self.vmax is not None:
+                vmin = self.vmin
+                vmax = self.vmax
+            else:
+                vmin = None
+                vmax = None
 
-        im = self.ax.imshow(
-            temp.T,
-            origin="lower",
-            extent=extent,
-            aspect="equal",
-            interpolation="bilinear",
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        # Recreate colorbar cleanly.
-        if hasattr(self, "colorbar") and self.colorbar is not None:
-            try:
-                self.colorbar.remove()
-            except Exception:
-                pass
-        self.colorbar = self.fig.colorbar(im, ax=self.ax)
-        self.colorbar.set_label("Temperature, °C")
-
-        for r in cfg.resistors:
-            cx = r.center_x_cm
-            cy = r.center_y_cm
-            l_cm = r.length_mm / 10.0
-            w_cm = r.width_mm / 10.0
-            rect = Rectangle(
-                (cx - l_cm / 2.0, cy - w_cm / 2.0),
-                l_cm,
-                w_cm,
-                fill=False,
-                linewidth=2,
+            im = self.ax.imshow(
+                temp.T,
+                origin="lower",
+                extent=extent,
+                aspect="equal",
+                interpolation="bilinear",
+                vmin=vmin,
+                vmax=vmax,
             )
-            self.ax.add_patch(rect)
-            self.ax.text(cx, cy, r.name, ha="center", va="center", fontsize=9)
 
-        max_idx = np.unravel_index(np.argmax(temp), temp.shape)
-        max_x = x_cm[max_idx[0]]
-        max_y = y_cm[max_idx[1]]
-        max_t = float(temp[max_idx])
-        avg_t = float(np.mean(temp))
+            self.colorbar = self.fig.colorbar(im, ax=self.ax)
+            self.colorbar.set_label("Temperature, °C")
 
-        self.ax.plot([max_x], [max_y], marker="x", markersize=10)
-        self.ax.text(max_x, max_y, f" max {max_t:.1f}°C", va="bottom")
+            for r in cfg.resistors:
+                cx = r.center_x_cm
+                cy = r.center_y_cm
+                l_cm = r.length_mm / 10.0
+                w_cm = r.width_mm / 10.0
+                rect = Rectangle(
+                    (cx - l_cm / 2.0, cy - w_cm / 2.0),
+                    l_cm,
+                    w_cm,
+                    fill=False,
+                    linewidth=2,
+                )
+                self.ax.add_patch(rect)
+                self.ax.text(cx, cy, r.name, ha="center", va="center", fontsize=9)
 
-        self.ax.set_title(f"{snap.label} | avg {avg_t:.1f}°C | max {max_t:.1f}°C")
-        self.ax.set_xlabel("x position, cm")
-        self.ax.set_ylabel("y position, cm")
-        self.ax.grid(True, alpha=0.25)
+            max_idx = np.unravel_index(np.argmax(temp), temp.shape)
+            max_x = x_cm[max_idx[0]]
+            max_y = y_cm[max_idx[1]]
+            max_t = float(temp[max_idx])
+            avg_t = float(np.mean(temp))
 
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
+            self.ax.plot([max_x], [max_y], marker="x", markersize=10)
+            self.ax.text(max_x, max_y, f" max {max_t:.1f}°C", va="bottom")
 
-        self.snapshot_label_var.set(f"{idx + 1}/{len(self.result.snapshots)}: {snap.label}")
+            self.ax.set_title(f"{snap.label} | avg {avg_t:.1f}°C | max {max_t:.1f}°C")
+            self.ax.set_xlabel("x position, cm")
+            self.ax.set_ylabel("y position, cm")
+            self.ax.grid(True, alpha=0.25)
+
+            # Avoid tight_layout here. On some Windows/Matplotlib combinations
+            # it can trigger deep recursion during rapid redraws.
+            self.fig.subplots_adjust(left=0.08, right=0.88, bottom=0.10, top=0.92)
+            self.canvas.draw_idle()
+
+            self.snapshot_label_var.set(f"{idx + 1}/{len(self.result.snapshots)}: {snap.label}")
+            self._current_snapshot_idx = idx
+        finally:
+            self._drawing_snapshot = False
 
     def _set_status(self, text: str):
         self.status_text.configure(state="normal")
