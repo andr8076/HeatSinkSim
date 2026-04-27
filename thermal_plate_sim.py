@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v5_2_gui.py
+thermal_plate_sim_v6_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
-Adds live layout preview, advanced cooling, even-spread banks, and a improved location optimizer.
+Adds live layout preview, advanced cooling, even-spread banks, and a deeper finite-difference-assisted optimizer.
 
 Features:
   - Tkinter UI
@@ -15,7 +15,7 @@ Features:
   - Advanced cooling estimator for orientation, enclosure, wall clearance, surface, air movement, hot-air path, and blockage
   - Live plate/resistor layout preview before running
   - Even-spread resistor bank generator
-  - Improved thermal-interaction optimizer for resistor locations
+  - Deep optimizer for resistor locations using fast scoring plus coarse finite-difference heat solves
   - Field help window
   - Config save/load as JSON
   - Export current heatmap PNG
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v5_2_gui.py
+  python3 thermal_plate_sim_v6_gui.py
 """
 
 from __future__ import annotations
@@ -764,8 +764,11 @@ Resistor length/width mm:
 Advanced cooling:
   Turns real-world placement into an effective h estimate. It is still an estimate; real temperature testing is required.
 
-Optimize locations:
-  Tries several evenly-spaced candidate layouts and picks the one with the lowest simulated steady-state maximum temperature. It is a practical search, not a perfect mathematical proof.
+Deep optimize:
+  v6 uses a deeper two-stage optimizer. First it generates many candidate layouts and scores them with a fast thermal-interaction model. Then it runs real coarse steady-state heat solves on the best candidates and locally refines the best layout. Use Deep for normal work; Extreme searches harder but can take much longer.
+
+Optimizer grid mm:
+  Cell size used only while optimizing locations. Larger is faster but rougher. 12-15 mm is good for deep search; 8-10 mm is more accurate but slower. The final Run simulation still uses the main Grid mm field.
 """
 
 
@@ -1369,11 +1372,551 @@ def optimize_layout_fast(
     return best_layout, best_score, tried
 
 
+def _optimizer_cfg_with_positions(cfg: PlateConfig, positions: List[Tuple[float, float]], grid_mm: float) -> PlateConfig:
+    """Create a temporary config used only by the optimizer's coarse heat solve."""
+    rs = [
+        Resistor(
+            name=r.name,
+            power_w=r.power_w,
+            center_x_cm=float(p[0]),
+            center_y_cm=float(p[1]),
+            length_mm=r.length_mm,
+            width_mm=r.width_mm,
+        )
+        for r, p in zip(cfg.resistors, positions)
+    ]
+
+    return PlateConfig(
+        plate_length_cm=cfg.plate_length_cm,
+        plate_width_cm=cfg.plate_width_cm,
+        plate_thickness_mm=cfg.plate_thickness_mm,
+        material_name=cfg.material_name,
+        thermal_conductivity_w_mk=cfg.thermal_conductivity_w_mk,
+        density_kg_m3=cfg.density_kg_m3,
+        heat_capacity_j_kgk=cfg.heat_capacity_j_kgk,
+        ambient_c=cfg.ambient_c,
+        convection_h_w_m2k=cfg.convection_h_w_m2k,
+        grid_mm=grid_mm,
+        resistors=rs,
+        initial_plate_temp_c=cfg.initial_plate_temp_c,
+        max_time_s=cfg.max_time_s,
+        snapshot_every_s=cfg.snapshot_every_s,
+        include_steady_state=False,
+    )
+
+
+def _layout_key(positions: List[Tuple[float, float]], decimals: int = 2) -> Tuple[Tuple[float, float], ...]:
+    return tuple((round(float(x), decimals), round(float(y), decimals)) for x, y in positions)
+
+
+def _score_layout_by_coarse_heat_solve(
+    cfg: PlateConfig,
+    positions: List[Tuple[float, float]],
+    margin_cm: float,
+    grid_mm: float,
+    cache: Dict,
+    stop_event: Optional[threading.Event] = None,
+    max_iter: int = 1800,
+    tolerance_c: float = 0.035,
+) -> Tuple[float, Dict]:
+    """
+    Score a layout by running an actual coarse steady-state plate heat solve.
+
+    This is slower than the analytical thermal-interaction objective, but it is
+    much closer to the real simulator behavior. It is used only by the optimizer,
+    not by the normal final simulation.
+    """
+    if stop_event is not None and stop_event.is_set():
+        raise RuntimeError("Optimization was cancelled.")
+
+    if not _layout_is_valid(cfg.resistors, positions, cfg.plate_length_cm, cfg.plate_width_cm, margin_cm):
+        return float("inf"), {"reason": "invalid"}
+
+    key = (round(grid_mm, 3), _layout_key(positions, 2))
+    if key in cache:
+        return cache[key]
+
+    opt_cfg = _optimizer_cfg_with_positions(cfg, positions, grid_mm)
+    x, y, dx, dy = build_grid(opt_cfg)
+    q, masks = add_heat_sources(opt_cfg, x, y, dx, dy)
+
+    temp, info = solve_steady_state(
+        opt_cfg,
+        q,
+        dx,
+        dy,
+        progress_callback=None,
+        stop_event=stop_event,
+        max_iter=max_iter,
+        tolerance_c=tolerance_c,
+    )
+
+    plate_max = float(np.max(temp))
+    plate_avg = float(np.mean(temp))
+    resistor_maxes = []
+    resistor_avgs = []
+
+    for r, mask, covered_area in masks:
+        resistor_maxes.append(float(np.max(temp[mask])))
+        resistor_avgs.append(float(np.mean(temp[mask])))
+
+    hottest_res = max(resistor_maxes) if resistor_maxes else plate_max
+
+    # Main goal: reduce the worst hotspot.
+    # Small tie-breakers:
+    #   - lower average plate temp is slightly better
+    #   - lower spread between resistor temps is slightly better
+    # This avoids ugly layouts that have one resistor clearly suffering.
+    score = max(plate_max, hottest_res)
+    score += 0.015 * plate_avg
+    if len(resistor_maxes) > 1:
+        score += 0.04 * float(np.std(resistor_maxes))
+
+    result = (
+        score,
+        {
+            "plate_max_c": plate_max,
+            "plate_avg_c": plate_avg,
+            "hottest_resistor_c": hottest_res,
+            "resistor_maxes_c": resistor_maxes,
+            "iterations": info.get("iterations"),
+            "converged": info.get("converged"),
+            "grid_cells": int(len(x) * len(y)),
+        },
+    )
+    cache[key] = result
+    return result
+
+
+def _random_valid_layout(
+    resistors: List[Resistor],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+    rng,
+    max_attempts_per_resistor: int = 2500,
+) -> Optional[List[Tuple[float, float]]]:
+    bounds = [_center_bounds_for_resistor(r, plate_x_cm, plate_y_cm, margin_cm) for r in resistors]
+    order = sorted(range(len(resistors)), key=lambda i: resistors[i].power_w, reverse=True)
+    assigned: List[Optional[Tuple[float, float]]] = [None] * len(resistors)
+
+    for idx in order:
+        xmin, xmax, ymin, ymax = bounds[idx]
+        placed = False
+        for _ in range(max_attempts_per_resistor):
+            p = (float(rng.uniform(xmin, xmax)), float(rng.uniform(ymin, ymax)))
+            ok = True
+            for j, other in enumerate(assigned):
+                if other is None:
+                    continue
+                if _rectangles_overlap(resistors[idx], p, resistors[j], other, 0.15):
+                    ok = False
+                    break
+            if ok:
+                assigned[idx] = p
+                placed = True
+                break
+        if not placed:
+            return None
+
+    return [(float(x), float(y)) for x, y in assigned]  # type: ignore[arg-type]
+
+
+def _jitter_layout(
+    layout: List[Tuple[float, float]],
+    resistors: List[Resistor],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+    rng,
+    sigma_cm: float,
+    attempts: int = 40,
+) -> Optional[List[Tuple[float, float]]]:
+    bounds = [_center_bounds_for_resistor(r, plate_x_cm, plate_y_cm, margin_cm) for r in resistors]
+
+    for _ in range(attempts):
+        out = []
+        for (x, y), (xmin, xmax, ymin, ymax) in zip(layout, bounds):
+            nx = min(xmax, max(xmin, float(x + rng.normal(0.0, sigma_cm))))
+            ny = min(ymax, max(ymin, float(y + rng.normal(0.0, sigma_cm))))
+            out.append((nx, ny))
+        if _layout_is_valid(resistors, out, plate_x_cm, plate_y_cm, margin_cm):
+            return out
+
+    return None
+
+
+def _locally_refine_layout_with_heat_solve(
+    cfg: PlateConfig,
+    start_layout: List[Tuple[float, float]],
+    margin_cm: float,
+    grid_mm: float,
+    cache: Dict,
+    step_sizes_cm: List[float],
+    stop_event: Optional[threading.Event],
+    progress_callback=None,
+    label: str = "coarse",
+    max_passes_per_step: int = 2,
+) -> Tuple[List[Tuple[float, float]], float, Dict, int]:
+    """
+    Coordinate/pattern-search refinement using actual coarse heat-solve scoring.
+
+    It tries moving each resistor in 8 directions, keeps the best improvement,
+    then repeats with smaller steps. This is slower than the fast optimizer but
+    much less likely to get stuck in obviously bad layouts.
+    """
+    current = [tuple(p) for p in start_layout]
+    current_score, current_info = _score_layout_by_coarse_heat_solve(
+        cfg, current, margin_cm, grid_mm, cache, stop_event=stop_event
+    )
+    evaluations = 1
+
+    directions = [
+        (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+        (1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0),
+    ]
+
+    bounds = [_center_bounds_for_resistor(r, cfg.plate_length_cm, cfg.plate_width_cm, margin_cm) for r in cfg.resistors]
+
+    for step_i, step in enumerate(step_sizes_cm, 1):
+        improved_this_step = True
+        passes = 0
+
+        while improved_this_step and passes < max_passes_per_step:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Optimization was cancelled.")
+
+            passes += 1
+            improved_this_step = False
+            best_trial = current
+            best_trial_score = current_score
+            best_trial_info = current_info
+
+            # Try hottest resistors first, if we know the current footprint temps.
+            order = list(range(len(cfg.resistors)))
+            maxes = current_info.get("resistor_maxes_c")
+            if isinstance(maxes, list) and len(maxes) == len(order):
+                order = sorted(order, key=lambda i: maxes[i], reverse=True)
+
+            for i in order:
+                xmin, xmax, ymin, ymax = bounds[i]
+
+                for dx_dir, dy_dir in directions:
+                    old_x, old_y = current[i]
+                    # Diagonal moves are scaled so they are not longer than axis moves.
+                    diag_scale = 0.7071 if dx_dir != 0.0 and dy_dir != 0.0 else 1.0
+                    nx = min(xmax, max(xmin, old_x + dx_dir * step * diag_scale))
+                    ny = min(ymax, max(ymin, old_y + dy_dir * step * diag_scale))
+
+                    trial = list(current)
+                    trial[i] = (nx, ny)
+
+                    if not _layout_is_valid(cfg.resistors, trial, cfg.plate_length_cm, cfg.plate_width_cm, margin_cm):
+                        continue
+
+                    trial_score, trial_info = _score_layout_by_coarse_heat_solve(
+                        cfg, trial, margin_cm, grid_mm, cache, stop_event=stop_event
+                    )
+                    evaluations += 1
+
+                    if trial_score < best_trial_score - 0.002:
+                        best_trial = trial
+                        best_trial_score = trial_score
+                        best_trial_info = trial_info
+
+            if best_trial_score < current_score - 0.002:
+                current = [tuple(p) for p in best_trial]
+                current_score = best_trial_score
+                current_info = best_trial_info
+                improved_this_step = True
+
+        if progress_callback is not None:
+            progress_callback(
+                f"{label} refine step {step_i}/{len(step_sizes_cm)} "
+                f"step={step:.2f} cm, best hotspot≈{current_info.get('plate_max_c', current_score):.1f} °C"
+            )
+
+    return current, current_score, current_info, evaluations
+
+
+def optimize_layout_deep(
+    cfg: PlateConfig,
+    margin_cm: float,
+    optimizer_grid_mm: float = 12.0,
+    depth: str = "Deep",
+    progress_callback=None,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[List[Tuple[float, float]], float, int, Dict]:
+    """
+    v6 deeper optimizer.
+
+    Stages:
+      1. Generate deterministic layouts: grids, rings, ellipses.
+      2. Add many random valid layouts and jittered variants.
+      3. Rank with the fast thermal-interaction objective.
+      4. Run actual coarse finite-difference steady-state heat solves on the best candidates.
+      5. Locally refine using actual coarse heat-solve scoring.
+      6. Re-score the best layout on a finer optimizer grid.
+
+    It still cannot prove a global optimum, but it is far deeper than v5.2 and
+    should avoid shallow "looks spaced but not thermally good" answers.
+    """
+    depth_key = str(depth).strip().lower()
+    if "extreme" in depth_key:
+        settings = {
+            "random_count": 4500,
+            "jitter_count": 900,
+            "top_fast": 220,
+            "top_fd": 100,
+            "starts_to_refine": 8,
+            "step_factor": [0.22, 0.14, 0.09, 0.055, 0.032, 0.018, 0.010],
+            "passes": 3,
+            "fine_grid_factor": 0.70,
+        }
+    elif "balanced" in depth_key or "fast" in depth_key:
+        settings = {
+            "random_count": 900,
+            "jitter_count": 220,
+            "top_fast": 90,
+            "top_fd": 35,
+            "starts_to_refine": 3,
+            "step_factor": [0.18, 0.10, 0.055, 0.030, 0.016],
+            "passes": 2,
+            "fine_grid_factor": 0.85,
+        }
+    else:
+        settings = {
+            "random_count": 2200,
+            "jitter_count": 520,
+            "top_fast": 150,
+            "top_fd": 65,
+            "starts_to_refine": 5,
+            "step_factor": [0.20, 0.125, 0.075, 0.045, 0.025, 0.014],
+            "passes": 2,
+            "fine_grid_factor": 0.75,
+        }
+
+    count = len(cfg.resistors)
+    if count < 1:
+        raise ValueError("No resistors to optimize.")
+
+    rng = np.random.default_rng(20260427)
+    plate_x_cm = cfg.plate_length_cm
+    plate_y_cm = cfg.plate_width_cm
+
+    optimizer_grid_mm = max(3.0, float(optimizer_grid_mm))
+    coarse_grid_mm = optimizer_grid_mm
+    fine_grid_mm = max(3.0, optimizer_grid_mm * settings["fine_grid_factor"])
+
+    if progress_callback is not None:
+        progress_callback(
+            f"Deep optimizer started: depth={depth}, coarse grid={coarse_grid_mm:g} mm, "
+            f"fine check grid={fine_grid_mm:g} mm"
+        )
+
+    candidates = generate_candidate_layouts(cfg.resistors, plate_x_cm, plate_y_cm, margin_cm)
+
+    # Include current layout as a candidate.
+    current_layout = [(r.center_x_cm, r.center_y_cm) for r in cfg.resistors]
+    if _layout_is_valid(cfg.resistors, current_layout, plate_x_cm, plate_y_cm, margin_cm):
+        candidates.append(current_layout)
+
+    # Include result from v5.2 fast optimizer as one strong seed.
+    try:
+        fast_best, fast_score, fast_tried = optimize_layout_fast(
+            resistors=cfg.resistors,
+            plate_x_cm=plate_x_cm,
+            plate_y_cm=plate_y_cm,
+            k_w_mk=cfg.thermal_conductivity_w_mk,
+            thickness_mm=cfg.plate_thickness_mm,
+            h_w_m2k=cfg.convection_h_w_m2k,
+            margin_cm=margin_cm,
+            progress_callback=None,
+            stop_event=stop_event,
+        )
+        candidates.append(fast_best)
+    except Exception:
+        pass
+
+    # Add random valid starts.
+    for i in range(settings["random_count"]):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Optimization was cancelled.")
+        layout = _random_valid_layout(cfg.resistors, plate_x_cm, plate_y_cm, margin_cm, rng)
+        if layout is not None:
+            candidates.append(layout)
+
+    # De-duplicate before jitter.
+    unique = []
+    seen = set()
+    for layout in candidates:
+        if not _layout_is_valid(cfg.resistors, layout, plate_x_cm, plate_y_cm, margin_cm):
+            continue
+        key = _layout_key(layout, 2)
+        if key not in seen:
+            seen.add(key)
+            unique.append(layout)
+
+    # Rank with fast objective and keep a useful top group.
+    def fast_score(layout):
+        return _thermal_interaction_objective(
+            resistors=cfg.resistors,
+            positions=layout,
+            plate_x_cm=plate_x_cm,
+            plate_y_cm=plate_y_cm,
+            k_w_mk=cfg.thermal_conductivity_w_mk,
+            thickness_mm=cfg.plate_thickness_mm,
+            h_w_m2k=cfg.convection_h_w_m2k,
+            margin_cm=margin_cm,
+        )
+
+    unique = sorted(unique, key=fast_score)
+
+    # Jitter around good starts. This explores "nearby but not obvious" positions.
+    max_span = max(plate_x_cm, plate_y_cm)
+    jitter_sources = unique[:min(30, len(unique))]
+    for _ in range(settings["jitter_count"]):
+        if not jitter_sources:
+            break
+        base = jitter_sources[int(rng.integers(0, len(jitter_sources)))]
+        sigma = float(rng.uniform(0.015, 0.12) * max_span)
+        layout = _jitter_layout(
+            base,
+            cfg.resistors,
+            plate_x_cm,
+            plate_y_cm,
+            margin_cm,
+            rng,
+            sigma_cm=sigma,
+        )
+        if layout is not None:
+            key = _layout_key(layout, 2)
+            if key not in seen:
+                seen.add(key)
+                unique.append(layout)
+
+    unique = sorted(unique, key=fast_score)
+    fast_shortlist = unique[:min(settings["top_fast"], len(unique))]
+
+    if progress_callback is not None:
+        progress_callback(
+            f"Generated {len(unique)} valid layouts. "
+            f"Heat-solving the best {min(settings['top_fd'], len(fast_shortlist))} candidates..."
+        )
+
+    cache: Dict = {}
+    fd_ranked = []
+    tried = len(unique)
+
+    for idx, layout in enumerate(fast_shortlist[:settings["top_fd"]], 1):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Optimization was cancelled.")
+
+        score, info = _score_layout_by_coarse_heat_solve(
+            cfg,
+            layout,
+            margin_cm,
+            coarse_grid_mm,
+            cache,
+            stop_event=stop_event,
+            max_iter=1800,
+            tolerance_c=0.035,
+        )
+        tried += 1
+        fd_ranked.append((score, layout, info))
+
+        if progress_callback is not None and (idx == 1 or idx % 5 == 0 or idx == settings["top_fd"]):
+            progress_callback(
+                f"Coarse heat solve {idx}/{min(settings['top_fd'], len(fast_shortlist))}: "
+                f"current best max≈{min(x[2].get('plate_max_c', x[0]) for x in fd_ranked):.1f} °C"
+            )
+
+    fd_ranked = sorted(fd_ranked, key=lambda x: x[0])
+    if not fd_ranked:
+        raise ValueError("Optimizer could not evaluate any layouts.")
+
+    refine_starts = fd_ranked[:min(settings["starts_to_refine"], len(fd_ranked))]
+
+    best_layout = [tuple(p) for p in refine_starts[0][1]]
+    best_score = float(refine_starts[0][0])
+    best_info = dict(refine_starts[0][2])
+
+    min_dim = min(plate_x_cm, plate_y_cm)
+    step_sizes = [max(0.25, min_dim * f) for f in settings["step_factor"]]
+
+    for start_i, (start_score, start_layout, start_info) in enumerate(refine_starts, 1):
+        if progress_callback is not None:
+            progress_callback(
+                f"Refining candidate {start_i}/{len(refine_starts)} "
+                f"starting max≈{start_info.get('plate_max_c', start_score):.1f} °C"
+            )
+
+        layout, score, info, evals = _locally_refine_layout_with_heat_solve(
+            cfg=cfg,
+            start_layout=[tuple(p) for p in start_layout],
+            margin_cm=margin_cm,
+            grid_mm=coarse_grid_mm,
+            cache=cache,
+            step_sizes_cm=step_sizes,
+            stop_event=stop_event,
+            progress_callback=progress_callback,
+            label=f"candidate {start_i}",
+            max_passes_per_step=settings["passes"],
+        )
+        tried += evals
+
+        if score < best_score:
+            best_layout = layout
+            best_score = score
+            best_info = info
+
+    # Final fine-grid check and small final refinement.
+    if progress_callback is not None:
+        progress_callback("Running finer-grid verification/refinement...")
+
+    fine_cache: Dict = {}
+    fine_steps = [max(0.20, min_dim * 0.025), max(0.15, min_dim * 0.012), 0.35]
+    best_layout, fine_score, fine_info, fine_evals = _locally_refine_layout_with_heat_solve(
+        cfg=cfg,
+        start_layout=best_layout,
+        margin_cm=margin_cm,
+        grid_mm=fine_grid_mm,
+        cache=fine_cache,
+        step_sizes_cm=fine_steps,
+        stop_event=stop_event,
+        progress_callback=progress_callback,
+        label="fine",
+        max_passes_per_step=1,
+    )
+    tried += fine_evals
+
+    details = {
+        "depth": depth,
+        "coarse_grid_mm": coarse_grid_mm,
+        "fine_grid_mm": fine_grid_mm,
+        "valid_layouts_generated": len(unique),
+        "coarse_fd_candidates": len(fd_ranked),
+        "final_plate_max_c": fine_info.get("plate_max_c"),
+        "final_hottest_resistor_c": fine_info.get("hottest_resistor_c"),
+        "final_plate_avg_c": fine_info.get("plate_avg_c"),
+        "final_grid_cells": fine_info.get("grid_cells"),
+        "score": fine_score,
+    }
+
+    if progress_callback is not None:
+        progress_callback(
+            f"Optimizer complete. Fine-grid max≈{fine_info.get('plate_max_c', fine_score):.1f} °C. "
+            f"Tried/evaluated about {tried} layouts/moves."
+        )
+
+    return best_layout, fine_score, tried, details
+
+
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v5.2")
+        self.title("Thermal Plate Simulator v6")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
@@ -1646,12 +2189,28 @@ class ThermalPlateGUI(tk.Tk):
         self.bank_len_var = tk.StringVar(value="50")
         self.bank_wid_var = tk.StringVar(value="20")
         self.bank_margin_var = tk.StringVar(value="1")
+        self.optimizer_depth_var = tk.StringVar(value="Deep")
+        self.optimizer_grid_var = tk.StringVar(value="12")
         bank_fields = [("Count", self.bank_count_var), ("W each", self.bank_power_var), ("Len mm", self.bank_len_var), ("Wid mm", self.bank_wid_var), ("Margin cm", self.bank_margin_var)]
         for bi, (blabel, bvar) in enumerate(bank_fields):
             ttk.Label(bank_frame, text=blabel).grid(row=bi // 2, column=(bi % 2) * 2, sticky="w", pady=2)
             ttk.Entry(bank_frame, textvariable=bvar, width=8).grid(row=bi // 2, column=(bi % 2) * 2 + 1, sticky="ew", pady=2)
-        ttk.Button(bank_frame, text="Create even bank", command=self._create_even_bank).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(bank_frame, text="Optimize locations", command=self._start_optimize_locations).grid(row=3, column=2, columnspan=2, sticky="ew", pady=(6, 0), padx=(4, 0))
+
+        ttk.Label(bank_frame, text="Opt depth").grid(row=3, column=0, sticky="w", pady=2)
+        opt_depth = ttk.Combobox(
+            bank_frame,
+            textvariable=self.optimizer_depth_var,
+            values=["Balanced", "Deep", "Extreme"],
+            state="readonly",
+            width=10,
+        )
+        opt_depth.grid(row=3, column=1, sticky="ew", pady=2)
+
+        ttk.Label(bank_frame, text="Opt grid mm").grid(row=3, column=2, sticky="w", pady=2)
+        ttk.Entry(bank_frame, textvariable=self.optimizer_grid_var, width=8).grid(row=3, column=3, sticky="ew", pady=2)
+
+        ttk.Button(bank_frame, text="Create even bank", command=self._create_even_bank).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(bank_frame, text="Deep optimize", command=self._start_optimize_locations).grid(row=4, column=2, columnspan=2, sticky="ew", pady=(6, 0), padx=(4, 0))
 
         run_frame = ttk.LabelFrame(parent, text="Run", padding=8)
         run_frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
@@ -1891,15 +2450,17 @@ class ThermalPlateGUI(tk.Tk):
             messagebox.showinfo("Optimizer", "Add at least two resistors to optimize spacing.")
             return
         self._optimization_running = True
+        self.stop_event.clear()
+        self.cancel_button.configure(state="normal")
         self._set_status(
-            "Optimizer running. v5.2 uses a thermal-interaction placement search, "
-            "not just a few fixed layouts. It tries to reduce source interaction, "
-            "avoid bad edge placement, and use both plate dimensions."
+            f"Deep optimizer running. Depth={self.optimizer_depth_var.get()}, "
+            f"optimizer grid={self.optimizer_grid_var.get()} mm.\n"
+            "This now uses actual coarse heat solves during optimization, so it can take longer."
         )
         def worker():
             try:
-                best_positions, best_temp, tried = self._optimize_locations_worker(cfg)
-                self.msg_queue.put(("opt_done", (best_positions, best_temp, tried)))
+                best_positions, best_temp, tried, details = self._optimize_locations_worker(cfg)
+                self.msg_queue.put(("opt_done", (best_positions, best_temp, tried, details)))
             except Exception as e:
                 tb = traceback.format_exc()
                 self.msg_queue.put(("opt_error", f"{e}\n\n{tb}"))
@@ -1911,32 +2472,49 @@ class ThermalPlateGUI(tk.Tk):
         except Exception:
             margin_cm = 1.0
 
-        positions, best_score, tried = optimize_layout_fast(
-            resistors=cfg.resistors,
-            plate_x_cm=cfg.plate_length_cm,
-            plate_y_cm=cfg.plate_width_cm,
-            k_w_mk=cfg.thermal_conductivity_w_mk,
-            thickness_mm=cfg.plate_thickness_mm,
-            h_w_m2k=cfg.convection_h_w_m2k,
+        try:
+            opt_grid_mm = parse_float(self.optimizer_grid_var.get(), "Optimizer grid", 3.0)
+        except Exception:
+            opt_grid_mm = 12.0
+
+        depth = self.optimizer_depth_var.get()
+
+        positions, best_score, tried, details = optimize_layout_deep(
+            cfg=cfg,
             margin_cm=margin_cm,
+            optimizer_grid_mm=opt_grid_mm,
+            depth=depth,
             progress_callback=lambda msg: self.msg_queue.put(("progress", msg)),
             stop_event=self.stop_event,
         )
 
-        return positions, best_score, tried
+        return positions, best_score, tried, details
 
-    def _apply_optimized_positions(self, positions: List[Tuple[float, float]], best_temp: float, tried: int):
+    def _apply_optimized_positions(self, positions: List[Tuple[float, float]], best_temp: float, tried: int, details: Optional[Dict] = None):
         for r, (x, y) in zip(self.resistors, positions):
             r.center_x_cm = x
             r.center_y_cm = y
         self._refresh_resistor_tree()
         self._schedule_preview_update()
-        self._set_status(
-            f"Optimizer finished. Tried/evaluated {tried} candidate layouts and local moves.\n"
-            f"Best thermal-interaction score: {best_temp:.3f}  lower is better.\n\n"
-            "Positions have been applied. Run the full simulation for the actual temperature result.\n"
-            "This optimizer is designed to avoid bad one-line layouts when the plate has usable space in both dimensions."
-        )
+        details = details or {}
+        msg = [
+            f"Deep optimizer finished. Tried/evaluated about {tried} layouts/moves.",
+            f"Best optimizer score: {best_temp:.3f}  lower is better.",
+        ]
+        if details:
+            msg.append(f"Depth: {details.get('depth')}")
+            msg.append(f"Generated valid layouts: {details.get('valid_layouts_generated')}")
+            msg.append(f"Coarse FD candidates: {details.get('coarse_fd_candidates')}")
+            msg.append(f"Optimizer coarse grid: {details.get('coarse_grid_mm')} mm")
+            msg.append(f"Optimizer fine grid: {details.get('fine_grid_mm')} mm")
+            if details.get("final_plate_max_c") is not None:
+                msg.append(f"Fine-grid estimated max: {details.get('final_plate_max_c'):.1f} °C")
+            if details.get("final_hottest_resistor_c") is not None:
+                msg.append(f"Fine-grid hottest resistor footprint: {details.get('final_hottest_resistor_c'):.1f} °C")
+        msg.append("")
+        msg.append("Positions have been applied. Run the full simulation for the final detailed result.")
+        msg.append("Use Extreme if this still looks too shallow, but it can take much longer.")
+        self._set_status("\n".join(msg))
 
     def _estimate_h_from_ui(self) -> Tuple[float, str]:
         orientation = key_from_display(ORIENTATION_OPTIONS, self.orientation_var.get())
@@ -2078,10 +2656,16 @@ class ThermalPlateGUI(tk.Tk):
                     messagebox.showerror("Simulation error", str(payload).split("\n\n")[0])
                 elif msg_type == "opt_done":
                     self._optimization_running = False
-                    positions, best_temp, tried = payload
-                    self._apply_optimized_positions(positions, best_temp, tried)
+                    self.cancel_button.configure(state="disabled")
+                    if len(payload) == 4:
+                        positions, best_temp, tried, details = payload
+                    else:
+                        positions, best_temp, tried = payload
+                        details = {}
+                    self._apply_optimized_positions(positions, best_temp, tried, details)
                 elif msg_type == "opt_error":
                     self._optimization_running = False
+                    self.cancel_button.configure(state="disabled")
                     self._append_status("Optimizer error:\n" + str(payload))
                     messagebox.showerror("Optimizer error", str(payload).split("\n\n")[0])
         except queue.Empty:
