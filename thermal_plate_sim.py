@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim.py
+thermal_plate_sim_v2.py
 
-Simple passive-cooling heat map simulator for a flat metal plate with one or more
-rectangular heat sources, such as chassis resistors bolted to a plate.
+Passive flat-plate thermal simulator with:
+  - Steady-state heatmap
+  - Optional transient / warm-up heatmaps over time
+  - Multiple rectangular resistors / heat sources
+  - Rough warm-up behavior estimate
+  - CSV and JSON outputs
 
 Model:
-    Thin plate, 2D heat spreading inside the plate.
-    Heat lost by natural convection from both large faces.
-    Steady-state heat map solved by finite differences.
+  Thin metal plate, 2D heat spreading.
+  Heat leaves both large faces by convection.
+  Resistors inject heat over their contact footprints.
 
 Important:
-    This is an engineering approximation, not a certified safety calculation.
-    Always test with a temperature sensor and use a cutoff/fuse for real hardware.
+  This is an engineering approximation, not a certified safety calculation.
+  Use real temperature measurement and a cutoff for real hardware.
+  The simulated temperature is plate/contact temperature, not guaranteed internal resistor temperature.
 
 Dependencies:
-    Python 3
-    numpy
-    matplotlib
-
-Install if needed:
-    python3 -m pip install numpy matplotlib
+  python3 -m pip install numpy matplotlib
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import math
-import os
+import re
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     import numpy as np
@@ -81,6 +82,15 @@ class PlateConfig:
     convection_h_w_m2k: float
     grid_mm: float
     resistors: List[Resistor]
+
+
+@dataclass
+class TransientConfig:
+    enabled: bool
+    initial_plate_temp_c: float
+    total_time_s: float
+    snapshot_times_s: List[float]
+    max_steps_without_confirm: int = 250000
 
 
 def ask_float(prompt: str, default: Optional[float] = None, min_value: Optional[float] = None) -> float:
@@ -136,6 +146,54 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
         print("Please answer yes or no.")
 
 
+def parse_time_list(raw: str) -> List[float]:
+    """
+    Accepts:
+      30s, 1m, 5m, 15m, 1h
+      or plain numbers, interpreted as minutes.
+    """
+    out: List[float] = []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for part in parts:
+        m = re.fullmatch(r"([0-9]+(?:[.,][0-9]+)?)(\s*[smhSMH]?)", part)
+        if not m:
+            raise ValueError(f"Could not understand time: {part}")
+
+        value = float(m.group(1).replace(",", "."))
+        unit = m.group(2).strip().lower()
+
+        if unit == "s":
+            seconds = value
+        elif unit == "h":
+            seconds = value * 3600.0
+        else:
+            # default and "m" are minutes
+            seconds = value * 60.0
+
+        if seconds > 0:
+            out.append(seconds)
+
+    return sorted(set(out))
+
+
+def format_time(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        return f"{minutes:.1f} min"
+    hours = minutes / 60.0
+    return f"{hours:.2f} h"
+
+
+def safe_filename_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60.0:.1f}min".replace(".", "p")
+    return f"{seconds / 3600.0:.2f}h".replace(".", "p")
+
+
 def choose_material() -> Tuple[str, float, float, float]:
     print("\nMaterial presets:")
     print("  1) aluminium / aluminum")
@@ -178,6 +236,7 @@ def make_config_interactive() -> PlateConfig:
 
     print("\n=== Cooling ===")
     ambient_c = ask_float("Ambient air temperature, °C", 25.0)
+
     print("\nConvection h guide:")
     print("  5  = weak passive, bad orientation/still air")
     print("  7  = normal passive estimate")
@@ -185,9 +244,12 @@ def make_config_interactive() -> PlateConfig:
     convection_h = ask_float("Convection coefficient h, W/m²K", 7.0, 0.1)
 
     print("\n=== Simulation grid ===")
-    print("Smaller grid = better detail, slower simulation.")
-    print("Good starting point: 2 to 5 mm")
-    grid_mm = ask_float("Grid cell size, mm", 2.5, 0.5)
+    print("Smaller grid = better detail, slower transient simulation.")
+    print("Good starting point:")
+    print("  2.5 mm = nice detail, slower transient")
+    print("  5.0 mm = good practical default")
+    print("  10 mm  = quick rough testing")
+    grid_mm = ask_float("Grid cell size, mm", 5.0, 0.5)
 
     print("\n=== Resistors / heat sources ===")
     n = ask_int("Number of resistors", 1, 1)
@@ -230,6 +292,41 @@ def make_config_interactive() -> PlateConfig:
         convection_h_w_m2k=convection_h,
         grid_mm=grid_mm,
         resistors=resistors,
+    )
+
+
+def make_transient_config_interactive(cfg: PlateConfig) -> TransientConfig:
+    if not ask_yes_no("\nRun transient / time-based warm-up simulation?", True):
+        return TransientConfig(
+            enabled=False,
+            initial_plate_temp_c=cfg.ambient_c,
+            total_time_s=0.0,
+            snapshot_times_s=[],
+        )
+
+    print("\n=== Transient simulation ===")
+    initial_temp = ask_float("Initial plate temperature, °C", cfg.ambient_c)
+
+    print("\nSnapshot examples:")
+    print("  30s, 1m, 5m, 15m, 30m, 1h")
+    print("Plain numbers are interpreted as minutes.")
+    while True:
+        raw = input("Times to save heatmaps [1m, 5m, 15m, 30m, 1h]: ").strip()
+        if raw == "":
+            raw = "1m, 5m, 15m, 30m, 1h"
+        try:
+            times = parse_time_list(raw)
+            if not times:
+                raise ValueError("No valid times entered.")
+            break
+        except ValueError as e:
+            print(e)
+
+    return TransientConfig(
+        enabled=True,
+        initial_plate_temp_c=initial_temp,
+        total_time_s=max(times),
+        snapshot_times_s=times,
     )
 
 
@@ -310,7 +407,7 @@ def solve_steady_state(cfg: PlateConfig, max_iter: int = 30000, tolerance_c: flo
     q is W/m² heat flux inserted into the plate.
     2*h because both large faces lose heat to air.
 
-    Edges use a zero-lateral-flux boundary approximation.
+    Edges use a zero-lateral-flux approximation.
     """
     x, y, dx, dy = build_grid(cfg)
     q, resistor_masks = add_heat_sources(cfg, x, y, dx, dy)
@@ -328,9 +425,6 @@ def solve_steady_state(cfg: PlateConfig, max_iter: int = 30000, tolerance_c: flo
     converged = False
     final_diff = None
 
-    # Jacobi iteration; stable and simple.
-    # np.pad(..., mode="edge") makes boundary outside equal to boundary cell,
-    # approximating insulated thin edges.
     for it in range(1, max_iter + 1):
         p = np.pad(theta, ((1, 1), (1, 1)), mode="edge")
         left = p[:-2, 1:-1]
@@ -363,6 +457,173 @@ def solve_steady_state(cfg: PlateConfig, max_iter: int = 30000, tolerance_c: flo
     }
 
 
+def transient_stability_dt(cfg: PlateConfig, dx: float, dy: float) -> float:
+    """
+    Explicit finite difference stability estimate.
+
+    Equation:
+      dtheta/dt = alpha*laplacian(theta) + source - beta*theta
+
+    Stable-ish explicit dt:
+      dt < 1 / (2*alpha*(1/dx² + 1/dy²) + beta)
+    """
+    k = cfg.thermal_conductivity_w_mk
+    rho = cfg.density_kg_m3
+    cp = cfg.heat_capacity_j_kgk
+    t = cfg.plate_thickness_mm / 1000.0
+    h = cfg.convection_h_w_m2k
+
+    alpha = k / (rho * cp)
+    beta = 2.0 * h / (rho * cp * t)
+
+    denom = 2.0 * alpha * ((1.0 / (dx * dx)) + (1.0 / (dy * dy))) + beta
+    return 0.45 / denom
+
+
+def run_transient(cfg: PlateConfig, tr: TransientConfig, base_result: dict, output_dir: Path):
+    """
+    Explicit transient solver.
+
+    It simulates real elapsed time from initial plate temperature toward steady-state.
+    For fine grids, this may require many time steps.
+    """
+    x = base_result["x"]
+    y = base_result["y"]
+    dx = base_result["dx"]
+    dy = base_result["dy"]
+    q = base_result["q"]
+    resistor_masks = base_result["resistor_masks"]
+
+    rho = cfg.density_kg_m3
+    cp = cfg.heat_capacity_j_kgk
+    t = cfg.plate_thickness_mm / 1000.0
+    k = cfg.thermal_conductivity_w_mk
+    h = cfg.convection_h_w_m2k
+
+    alpha = k / (rho * cp)
+    beta = 2.0 * h / (rho * cp * t)
+    source = q / (rho * cp * t)
+
+    dt = transient_stability_dt(cfg, dx, dy)
+    steps = int(math.ceil(tr.total_time_s / dt))
+    dt = tr.total_time_s / steps  # exact landing on total time
+
+    print("\nTransient simulation details:")
+    print(f"  Grid: {len(x)} × {len(y)} cells")
+    print(f"  Stable timestep used: {dt:.4f} s")
+    print(f"  Number of timesteps: {steps}")
+
+    if steps > tr.max_steps_without_confirm:
+        print("\nWarning:")
+        print(f"  This transient simulation needs about {steps} timesteps.")
+        print("  It may take a while.")
+        print("  To speed it up, increase grid cell size, for example 5 mm or 10 mm.")
+        if not ask_yes_no("Continue anyway?", True):
+            print("Transient simulation skipped.")
+            return None
+
+    theta = np.full_like(q, tr.initial_plate_temp_c - cfg.ambient_c, dtype=float)
+
+    snapshot_times = sorted(tr.snapshot_times_s)
+    snapshot_index = 0
+    snapshots: Dict[float, np.ndarray] = {}
+    rows = []
+
+    cell_area = dx * dy
+
+    def store_snapshot(time_s: float):
+        temp = cfg.ambient_c + theta
+        snap = temp.copy()
+        snapshots[time_s] = snap
+
+        row = {
+            "time_s": time_s,
+            "time_label": format_time(time_s),
+            "avg_temp_c": float(np.mean(snap)),
+            "max_temp_c": float(np.max(snap)),
+            "min_temp_c": float(np.min(snap)),
+            "convective_loss_w": float(np.sum(2.0 * h * (snap - cfg.ambient_c) * cell_area)),
+        }
+
+        for r, mask, covered_area in resistor_masks:
+            row[f"{r.name}_avg_temp_c"] = float(np.mean(snap[mask]))
+            row[f"{r.name}_max_temp_c"] = float(np.max(snap[mask]))
+
+        rows.append(row)
+
+    current_time = 0.0
+
+    for step in range(1, steps + 1):
+        p = np.pad(theta, ((1, 1), (1, 1)), mode="edge")
+        left = p[:-2, 1:-1]
+        right = p[2:, 1:-1]
+        down = p[1:-1, :-2]
+        up = p[1:-1, 2:]
+
+        lap = (
+            (left - 2.0 * theta + right) / (dx * dx)
+            + (down - 2.0 * theta + up) / (dy * dy)
+        )
+
+        theta += dt * (alpha * lap + source - beta * theta)
+        current_time = step * dt
+
+        while snapshot_index < len(snapshot_times) and current_time >= snapshot_times[snapshot_index] - 0.5 * dt:
+            store_snapshot(snapshot_times[snapshot_index])
+            snapshot_index += 1
+
+    # Ensure final requested snapshot exists even with rounding.
+    while snapshot_index < len(snapshot_times):
+        store_snapshot(snapshot_times[snapshot_index])
+        snapshot_index += 1
+
+    # Save transient summary CSV.
+    csv_path = output_dir / "transient_summary.csv"
+    if rows:
+        keys = list(rows[0].keys())
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    # Save heatmaps.
+    heatmap_paths = []
+    for time_s, temp in snapshots.items():
+        png_path = output_dir / f"transient_heatmap_{safe_filename_time(time_s)}.png"
+        plot_heatmap(
+            cfg=cfg,
+            result={**base_result, "temp_c": temp},
+            output_png=png_path,
+            title=f"Plate heat map after {format_time(time_s)}",
+        )
+        heatmap_paths.append(str(png_path))
+
+    # Save temperature grids for each snapshot.
+    for time_s, temp in snapshots.items():
+        csv_grid_path = output_dir / f"temperature_grid_{safe_filename_time(time_s)}.csv"
+        save_csv_from_temp(base_result["x"], base_result["y"], temp, csv_grid_path)
+
+    transient_json = {
+        "enabled": True,
+        "initial_plate_temp_c": tr.initial_plate_temp_c,
+        "total_time_s": tr.total_time_s,
+        "dt_s": dt,
+        "steps": steps,
+        "snapshots": rows,
+        "heatmap_files": heatmap_paths,
+    }
+    json_path = output_dir / "transient_summary.json"
+    json_path.write_text(json.dumps(transient_json, indent=2), encoding="utf-8")
+
+    print("\nTransient files written:")
+    print(f"  Transient summary CSV: {csv_path}")
+    print(f"  Transient summary JSON: {json_path}")
+    for p in heatmap_paths:
+        print(f"  Heatmap: {p}")
+
+    return transient_json
+
+
 def calculate_summary(cfg: PlateConfig, result: dict):
     temp = result["temp_c"]
     theta = result["theta_c"]
@@ -377,20 +638,16 @@ def calculate_summary(cfg: PlateConfig, result: dict):
     total_power = sum(r.power_w for r in cfg.resistors)
     top_bottom_area = 2.0 * plate_l_m * plate_w_m
     edge_area = 2.0 * (plate_l_m + plate_w_m) * plate_t_m
-    exposed_area_main = top_bottom_area
     exposed_area_with_edges = top_bottom_area + edge_area
 
-    # The solver currently only cools through the two large faces.
-    predicted_avg_rise_simple = total_power / (cfg.convection_h_w_m2k * exposed_area_main)
-
+    predicted_avg_rise_simple = total_power / (cfg.convection_h_w_m2k * top_bottom_area)
     conv_loss_grid = float(np.sum(2.0 * cfg.convection_h_w_m2k * theta * cell_area))
 
     volume = plate_l_m * plate_w_m * plate_t_m
     mass = cfg.density_kg_m3 * volume
     thermal_capacity = mass * cfg.heat_capacity_j_kgk
 
-    # Lumped average warm-up time constant, not the hotspot time constant.
-    tau_s = thermal_capacity / (cfg.convection_h_w_m2k * exposed_area_main)
+    tau_s = thermal_capacity / (cfg.convection_h_w_m2k * top_bottom_area)
     t90_s = -math.log(0.10) * tau_s
     t95_s = -math.log(0.05) * tau_s
 
@@ -406,8 +663,8 @@ def calculate_summary(cfg: PlateConfig, result: dict):
 
     return {
         "total_power_w": total_power,
-        "plate_area_both_sides_m2": exposed_area_main,
-        "plate_area_both_sides_cm2": exposed_area_main * 10000.0,
+        "plate_area_both_sides_m2": top_bottom_area,
+        "plate_area_both_sides_cm2": top_bottom_area * 10000.0,
         "plate_area_with_edges_cm2": exposed_area_with_edges * 10000.0,
         "simple_average_rise_c": predicted_avg_rise_simple,
         "simulated_average_temp_c": float(np.mean(temp)),
@@ -424,18 +681,8 @@ def calculate_summary(cfg: PlateConfig, result: dict):
     }
 
 
-def format_time(seconds: float) -> str:
-    if seconds < 90:
-        return f"{seconds:.0f} s"
-    minutes = seconds / 60.0
-    if minutes < 90:
-        return f"{minutes:.1f} min"
-    hours = minutes / 60.0
-    return f"{hours:.2f} h"
-
-
 def print_summary(cfg: PlateConfig, result: dict, summary: dict):
-    print("\n================ RESULTS ================")
+    print("\n================ STEADY-STATE RESULTS ================")
     print(f"Solver converged: {result['converged']} after {result['iterations']} iterations")
     print(f"Final iteration change: {result['final_diff']:.6f} °C")
 
@@ -493,7 +740,7 @@ def print_summary(cfg: PlateConfig, result: dict, summary: dict):
     print("  - Real resistor body may be hotter than the simulated plate contact area.")
 
 
-def plot_heatmap(cfg: PlateConfig, result: dict, output_png: Path):
+def plot_heatmap(cfg: PlateConfig, result: dict, output_png: Path, title: str = "Steady-state plate heat map"):
     temp = result["temp_c"]
     x = result["x"]
     y = result["y"]
@@ -539,7 +786,7 @@ def plot_heatmap(cfg: PlateConfig, result: dict, output_png: Path):
     ax.plot([max_x], [max_y], marker="x", markersize=10)
     ax.text(max_x, max_y, f" max {max_t:.1f}°C", va="bottom")
 
-    ax.set_title("Steady-state plate heat map")
+    ax.set_title(title)
     ax.set_xlabel("x position, cm")
     ax.set_ylabel("y position, cm")
     ax.grid(True, alpha=0.25)
@@ -549,16 +796,19 @@ def plot_heatmap(cfg: PlateConfig, result: dict, output_png: Path):
     plt.close(fig)
 
 
-def save_csv(cfg: PlateConfig, result: dict, output_csv: Path):
-    temp = result["temp_c"]
-    x = result["x"] * 100.0
-    y = result["y"] * 100.0
+def save_csv_from_temp(x_m, y_m, temp, output_csv: Path):
+    x_cm = x_m * 100.0
+    y_cm = y_m * 100.0
 
     with output_csv.open("w", encoding="utf-8") as f:
         f.write("x_cm,y_cm,temp_c\n")
-        for ix, xv in enumerate(x):
-            for iy, yv in enumerate(y):
+        for ix, xv in enumerate(x_cm):
+            for iy, yv in enumerate(y_cm):
                 f.write(f"{xv:.6f},{yv:.6f},{temp[ix, iy]:.6f}\n")
+
+
+def save_csv(cfg: PlateConfig, result: dict, output_csv: Path):
+    save_csv_from_temp(result["x"], result["y"], result["temp_c"], output_csv)
 
 
 def example_config() -> PlateConfig:
@@ -573,7 +823,7 @@ def example_config() -> PlateConfig:
         heat_capacity_j_kgk=mat["cp"],
         ambient_c=25.0,
         convection_h_w_m2k=7.0,
-        grid_mm=2.5,
+        grid_mm=5.0,
         resistors=[
             Resistor(
                 name="R1",
@@ -589,16 +839,15 @@ def example_config() -> PlateConfig:
 
 def main():
     print("====================================================")
-    print(" Passive Plate Thermal Simulator")
+    print(" Passive Plate Thermal Simulator v2")
     print("====================================================")
-    print("This simulates heat spreading in a flat plate and")
-    print("cooling by passive air convection from both faces.")
+    print("Steady-state heatmap + optional time-based warm-up heatmaps.")
 
     cfg: PlateConfig
 
     print("\nStart options:")
     print("  1) Enter values manually")
-    print("  2) Use example: 25×25×5 mm aluminium plate, 50 W resistor")
+    print("  2) Use example: 25×25 cm × 5 mm aluminium plate, 50 W resistor")
     print("  3) Load JSON config")
     choice = input("Choose [1]: ").strip() or "1"
 
@@ -610,6 +859,8 @@ def main():
     else:
         cfg = make_config_interactive()
 
+    tr = make_transient_config_interactive(cfg)
+
     output_dir = Path("thermal_output")
     output_dir.mkdir(exist_ok=True)
 
@@ -618,28 +869,30 @@ def main():
         save_config(cfg, save_path)
         print(f"Saved config: {save_path}")
 
-    print("\nSolving. This can take a few seconds on fine grids...")
+    print("\nSolving steady-state final temperature...")
     result = solve_steady_state(cfg)
     summary = calculate_summary(cfg, result)
 
     print_summary(cfg, result, summary)
 
-    png_path = output_dir / "heatmap.png"
-    csv_path = output_dir / "temperature_grid.csv"
-    summary_path = output_dir / "summary.json"
+    steady_png_path = output_dir / "steady_state_heatmap.png"
+    steady_csv_path = output_dir / "steady_state_temperature_grid.csv"
+    summary_path = output_dir / "steady_state_summary.json"
 
-    plot_heatmap(cfg, result, png_path)
-    save_csv(cfg, result, csv_path)
-
+    plot_heatmap(cfg, result, steady_png_path, title="Steady-state plate heat map")
+    save_csv(cfg, result, steady_csv_path)
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    print("\nFiles written:")
-    print(f"  Heat map: {png_path}")
-    print(f"  Temperature grid CSV: {csv_path}")
+    print("\nSteady-state files written:")
+    print(f"  Heat map: {steady_png_path}")
+    print(f"  Temperature grid CSV: {steady_csv_path}")
     print(f"  Summary JSON: {summary_path}")
 
-    if ask_yes_no("\nOpen heat map window now?", False):
-        img = plt.imread(png_path)
+    if tr.enabled:
+        run_transient(cfg, tr, result, output_dir)
+
+    if ask_yes_no("\nOpen steady-state heat map window now?", False):
+        img = plt.imread(steady_png_path)
         plt.figure(figsize=(9, 7))
         plt.imshow(img)
         plt.axis("off")
