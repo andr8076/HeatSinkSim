@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v3_gui.py
+thermal_plate_sim_v4_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
+
+Adds an advanced cooling estimator for passive builds.
 
 Features:
   - Tkinter UI
@@ -10,6 +12,7 @@ Features:
   - Time-based transient simulation
   - Slider through time snapshots
   - Optional steady-state final heatmap
+  - Advanced cooling estimator for orientation, enclosure, wall clearance, surface, air movement, hot-air path, and blockage
   - Config save/load as JSON
   - Export current heatmap PNG
   - Export current temperature grid CSV
@@ -33,7 +36,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v3_gui.py
+  python3 thermal_plate_sim_v4_gui.py
 """
 
 from __future__ import annotations
@@ -97,6 +100,17 @@ class PlateConfig:
     max_time_s: float
     snapshot_every_s: float
     include_steady_state: bool
+
+    # Advanced cooling estimate inputs. If disabled, convection_h_w_m2k is used directly.
+    advanced_cooling_enabled: bool = False
+    orientation: str = "vertical"
+    environment: str = "open_air"
+    wall_clearance_cm: float = 20.0
+    surface_finish: str = "bare_metal"
+    air_movement: str = "still_air"
+    hot_air_path: str = "free_rise"
+    blockage_percent: float = 0.0
+    cooling_notes: str = ""
 
 
 @dataclass
@@ -187,6 +201,147 @@ def safe_time_name(label: str) -> str:
         .replace("/", "_")
         .replace("°", "")
     )
+
+
+ORIENTATION_OPTIONS = {
+    "vertical": "Vertical plate",
+    "horizontal_free": "Horizontal, both sides open",
+    "horizontal_top_open": "Horizontal, top open / underside weaker",
+    "horizontal_under_blocked": "Horizontal, underside blocked",
+}
+
+ENVIRONMENT_OPTIONS = {
+    "open_air": "Open air",
+    "partly_enclosed": "Partly enclosed",
+    "enclosed_box": "Enclosed box",
+    "narrow_gap": "Narrow gap / channel",
+}
+
+SURFACE_OPTIONS = {
+    "bare_metal": "Bare metal / normal",
+    "matte_black": "Matte black / black anodized",
+    "dark_paint": "Dark paint",
+    "shiny_metal": "Shiny / polished metal",
+}
+
+AIR_MOVEMENT_OPTIONS = {
+    "dead_still": "Dead still air",
+    "still_air": "Normal still room air",
+    "slight_movement": "Slight room movement",
+    "noticeable_draft": "Noticeable natural draft",
+}
+
+HOT_AIR_PATH_OPTIONS = {
+    "free_rise": "Hot air can rise freely",
+    "somewhat_blocked": "Hot air partly blocked",
+    "trapped_above": "Hot air trapped above plate",
+}
+
+
+def estimate_passive_h(
+    orientation: str,
+    environment: str,
+    wall_clearance_cm: float,
+    surface_finish: str,
+    air_movement: str,
+    hot_air_path: str,
+    blockage_percent: float,
+) -> Tuple[float, str]:
+    """
+    Conservative heuristic for an effective passive convection coefficient h.
+
+    This does not replace measurement. It only helps choose a less fantasy-like h.
+    The simulator still uses one uniform h across both large plate faces.
+    """
+
+    # Start from a geometry/orientation base. These values are intentionally simple.
+    # They represent effective still-air cooling from the two large faces.
+    orientation_h = {
+        "vertical": 7.0,
+        "horizontal_free": 5.8,
+        "horizontal_top_open": 5.0,
+        "horizontal_under_blocked": 3.8,
+    }
+
+    environment_mult = {
+        "open_air": 1.00,
+        "partly_enclosed": 0.70,
+        "enclosed_box": 0.40,
+        "narrow_gap": 0.45,
+    }
+
+    # Surface finish is mostly radiation, not pure convection. We fold it in as a small
+    # equivalent-h correction so the simple model remains usable.
+    surface_mult = {
+        "bare_metal": 1.00,
+        "matte_black": 1.10,
+        "dark_paint": 1.08,
+        "shiny_metal": 0.90,
+    }
+
+    air_mult = {
+        "dead_still": 0.80,
+        "still_air": 1.00,
+        "slight_movement": 1.25,
+        "noticeable_draft": 1.60,
+    }
+
+    hot_path_mult = {
+        "free_rise": 1.00,
+        "somewhat_blocked": 0.75,
+        "trapped_above": 0.50,
+    }
+
+    c = max(0.0, wall_clearance_cm)
+    if c >= 20:
+        clearance_mult = 1.00
+    elif c >= 10:
+        clearance_mult = 0.90
+    elif c >= 5:
+        clearance_mult = 0.75
+    elif c >= 2:
+        clearance_mult = 0.55
+    elif c >= 1:
+        clearance_mult = 0.40
+    else:
+        clearance_mult = 0.25
+
+    block = min(100.0, max(0.0, blockage_percent))
+    blockage_mult = max(0.35, 1.0 - 0.006 * block)
+
+    base_h = orientation_h.get(orientation, 7.0)
+    h = base_h
+    h *= environment_mult.get(environment, 1.0)
+    h *= clearance_mult
+    h *= surface_mult.get(surface_finish, 1.0)
+    h *= air_mult.get(air_movement, 1.0)
+    h *= hot_path_mult.get(hot_air_path, 1.0)
+    h *= blockage_mult
+
+    # Keep it within a sane range for passive/no-fan setups.
+    h = max(1.0, min(15.0, h))
+
+    notes = [
+        f"orientation base h={base_h:.2f}",
+        f"environment ×{environment_mult.get(environment, 1.0):.2f}",
+        f"clearance ×{clearance_mult:.2f}",
+        f"surface ×{surface_mult.get(surface_finish, 1.0):.2f}",
+        f"air movement ×{air_mult.get(air_movement, 1.0):.2f}",
+        f"hot-air path ×{hot_path_mult.get(hot_air_path, 1.0):.2f}",
+        f"blockage ×{blockage_mult:.2f}",
+    ]
+    return h, "; ".join(notes)
+
+
+def display_from_key(options: Dict[str, str], key: str) -> str:
+    return options.get(key, key)
+
+
+def key_from_display(options: Dict[str, str], display: str) -> str:
+    for k, v in options.items():
+        if v == display:
+            return k
+    return display
 
 
 def build_grid(cfg: PlateConfig):
@@ -519,6 +674,9 @@ def calculate_summary(
 
     return {
         "total_power_w": total_power_w,
+        "effective_h_w_m2k": cfg.convection_h_w_m2k,
+        "advanced_cooling_enabled": cfg.advanced_cooling_enabled,
+        "cooling_notes": cfg.cooling_notes,
         "plate_area_both_faces_cm2": top_bottom_area_m2 * 10000.0,
         "plate_area_with_edges_cm2": (top_bottom_area_m2 + edge_area_m2) * 10000.0,
         "mass_kg": mass_kg,
@@ -550,7 +708,7 @@ class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v3")
+        self.title("Thermal Plate Simulator v4")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
@@ -568,6 +726,7 @@ class ThermalPlateGUI(tk.Tk):
 
         self._build_ui()
         self._refresh_resistor_tree()
+        self._update_estimated_h()
         self.after(100, self._poll_queue)
 
     def _build_ui(self):
@@ -652,6 +811,53 @@ class ThermalPlateGUI(tk.Tk):
             justify="left",
         )
         hint.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        advanced_frame = ttk.LabelFrame(parent, text="Advanced cooling estimate", padding=8)
+        advanced_frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        row += 1
+
+        self.advanced_cooling_var = tk.BooleanVar(value=False)
+        self.orientation_var = tk.StringVar(value=ORIENTATION_OPTIONS["vertical"])
+        self.environment_var = tk.StringVar(value=ENVIRONMENT_OPTIONS["open_air"])
+        self.clearance_var = tk.StringVar(value="20")
+        self.surface_var = tk.StringVar(value=SURFACE_OPTIONS["bare_metal"])
+        self.air_movement_var = tk.StringVar(value=AIR_MOVEMENT_OPTIONS["still_air"])
+        self.hot_air_path_var = tk.StringVar(value=HOT_AIR_PATH_OPTIONS["free_rise"])
+        self.blockage_var = tk.StringVar(value="0")
+        self.estimated_h_var = tk.StringVar(value="Estimated h: disabled")
+
+        ttk.Checkbutton(
+            advanced_frame,
+            text="Use advanced estimate instead of manual h",
+            variable=self.advanced_cooling_var,
+            command=self._update_estimated_h,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        self._combo_row(advanced_frame, 1, "Orientation", self.orientation_var, list(ORIENTATION_OPTIONS.values()))
+        self._combo_row(advanced_frame, 2, "Environment", self.environment_var, list(ENVIRONMENT_OPTIONS.values()))
+        self._entry_row(advanced_frame, 3, "Wall gap cm", self.clearance_var)
+        self._combo_row(advanced_frame, 4, "Surface", self.surface_var, list(SURFACE_OPTIONS.values()))
+        self._combo_row(advanced_frame, 5, "Air movement", self.air_movement_var, list(AIR_MOVEMENT_OPTIONS.values()))
+        self._combo_row(advanced_frame, 6, "Hot air path", self.hot_air_path_var, list(HOT_AIR_PATH_OPTIONS.values()))
+        self._entry_row(advanced_frame, 7, "Blockage %", self.blockage_var)
+
+        ttk.Button(advanced_frame, text="Update estimate", command=self._update_estimated_h).grid(row=8, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(advanced_frame, textvariable=self.estimated_h_var, foreground="#333333").grid(row=8, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+
+        adv_hint = ttk.Label(
+            advanced_frame,
+            text="This is a conservative effective-h guess. Real testing still wins.",
+            foreground="#555555",
+            justify="left",
+        )
+        adv_hint.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        for var in [
+            self.orientation_var, self.environment_var, self.clearance_var,
+            self.surface_var, self.air_movement_var, self.hot_air_path_var,
+            self.blockage_var,
+        ]:
+            var.trace_add("write", lambda *args: self._update_estimated_h())
 
         resistor_frame = ttk.LabelFrame(parent, text="Resistors", padding=8)
         resistor_frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
@@ -794,6 +1000,14 @@ class ThermalPlateGUI(tk.Tk):
         parent.columnconfigure(1, weight=1)
         return entry
 
+    def _combo_row(self, parent, row: int, label: str, var: tk.StringVar, values: List[str]):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
+        combo = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=24)
+        combo.grid(row=row, column=1, sticky="ew", pady=2)
+        combo.bind("<<ComboboxSelected>>", lambda event: self._update_estimated_h())
+        parent.columnconfigure(1, weight=1)
+        return combo
+
     def _material_changed(self, event=None):
         name = self.material_var.get()
         if name in MATERIALS:
@@ -883,7 +1097,41 @@ class ThermalPlateGUI(tk.Tk):
         self._refresh_resistor_tree()
         self._set_status("Loaded example with four 50 W resistors spread around the center.")
 
+    def _estimate_h_from_ui(self) -> Tuple[float, str]:
+        orientation = key_from_display(ORIENTATION_OPTIONS, self.orientation_var.get())
+        environment = key_from_display(ENVIRONMENT_OPTIONS, self.environment_var.get())
+        surface = key_from_display(SURFACE_OPTIONS, self.surface_var.get())
+        air = key_from_display(AIR_MOVEMENT_OPTIONS, self.air_movement_var.get())
+        hot_path = key_from_display(HOT_AIR_PATH_OPTIONS, self.hot_air_path_var.get())
+        clearance = parse_float(self.clearance_var.get(), "Wall gap", 0.0)
+        blockage = parse_float(self.blockage_var.get(), "Blockage", 0.0)
+        return estimate_passive_h(
+            orientation=orientation,
+            environment=environment,
+            wall_clearance_cm=clearance,
+            surface_finish=surface,
+            air_movement=air,
+            hot_air_path=hot_path,
+            blockage_percent=blockage,
+        )
+
+    def _update_estimated_h(self):
+        try:
+            h, _notes = self._estimate_h_from_ui()
+            if self.advanced_cooling_var.get():
+                self.estimated_h_var.set(f"Using h ≈ {h:.2f} W/m²K")
+            else:
+                self.estimated_h_var.set(f"Estimate h ≈ {h:.2f} W/m²K")
+        except Exception:
+            if hasattr(self, "estimated_h_var"):
+                self.estimated_h_var.set("Estimate h: invalid advanced input")
+
     def _read_config(self) -> PlateConfig:
+        advanced_enabled = bool(self.advanced_cooling_var.get())
+        estimated_h, cooling_notes = self._estimate_h_from_ui()
+        manual_h = parse_float(self.h_var.get(), "Convection h", 0.1)
+        effective_h = estimated_h if advanced_enabled else manual_h
+
         cfg = PlateConfig(
             plate_length_cm=parse_float(self.plate_length_var.get(), "Plate length", 0.1),
             plate_width_cm=parse_float(self.plate_width_var.get(), "Plate width", 0.1),
@@ -893,13 +1141,22 @@ class ThermalPlateGUI(tk.Tk):
             density_kg_m3=parse_float(self.rho_var.get(), "Density", 1.0),
             heat_capacity_j_kgk=parse_float(self.cp_var.get(), "Heat capacity", 1.0),
             ambient_c=parse_float(self.ambient_var.get(), "Ambient temperature"),
-            convection_h_w_m2k=parse_float(self.h_var.get(), "Convection h", 0.1),
+            convection_h_w_m2k=effective_h,
             grid_mm=parse_float(self.grid_var.get(), "Grid size", 0.5),
             resistors=list(self.resistors),
             initial_plate_temp_c=parse_float(self.initial_temp_var.get(), "Initial plate temperature"),
             max_time_s=parse_time_to_seconds(self.max_time_var.get(), "Max time"),
             snapshot_every_s=parse_time_to_seconds(self.snapshot_every_var.get(), "Snapshot every"),
             include_steady_state=bool(self.include_steady_var.get()),
+            advanced_cooling_enabled=advanced_enabled,
+            orientation=key_from_display(ORIENTATION_OPTIONS, self.orientation_var.get()),
+            environment=key_from_display(ENVIRONMENT_OPTIONS, self.environment_var.get()),
+            wall_clearance_cm=parse_float(self.clearance_var.get(), "Wall gap", 0.0),
+            surface_finish=key_from_display(SURFACE_OPTIONS, self.surface_var.get()),
+            air_movement=key_from_display(AIR_MOVEMENT_OPTIONS, self.air_movement_var.get()),
+            hot_air_path=key_from_display(HOT_AIR_PATH_OPTIONS, self.hot_air_path_var.get()),
+            blockage_percent=parse_float(self.blockage_var.get(), "Blockage", 0.0),
+            cooling_notes=cooling_notes,
         )
 
         if cfg.snapshot_every_s > cfg.max_time_s:
@@ -1006,6 +1263,12 @@ class ThermalPlateGUI(tk.Tk):
         lines.append("")
         lines.append(f"Grid: {s['grid_cells_x']} × {s['grid_cells_y']}")
         lines.append(f"Total power: {s['total_power_w']:.2f} W")
+        lines.append(f"Effective h used: {result.cfg.convection_h_w_m2k:.2f} W/m²K")
+        if result.cfg.advanced_cooling_enabled:
+            lines.append("Cooling mode: advanced estimate")
+            lines.append(f"Cooling factors: {result.cfg.cooling_notes}")
+        else:
+            lines.append("Cooling mode: manual h")
         lines.append(f"Plate area, both faces: {s['plate_area_both_faces_cm2']:.0f} cm²")
         lines.append(f"Mass: {s['mass_kg']:.3f} kg")
         lines.append(f"Heat capacity: {s['heat_capacity_j_per_c']:.0f} J/°C")
@@ -1204,6 +1467,15 @@ class ThermalPlateGUI(tk.Tk):
         self.max_time_var.set(format_time(cfg.max_time_s).replace(" ", ""))
         self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(" ", ""))
         self.include_steady_var.set(cfg.include_steady_state)
+        self.advanced_cooling_var.set(getattr(cfg, "advanced_cooling_enabled", False))
+        self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS, getattr(cfg, "orientation", "vertical")))
+        self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS, getattr(cfg, "environment", "open_air")))
+        self.clearance_var.set(f"{getattr(cfg, 'wall_clearance_cm', 20.0):g}")
+        self.surface_var.set(display_from_key(SURFACE_OPTIONS, getattr(cfg, "surface_finish", "bare_metal")))
+        self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS, getattr(cfg, "air_movement", "still_air")))
+        self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS, getattr(cfg, "hot_air_path", "free_rise")))
+        self.blockage_var.set(f"{getattr(cfg, 'blockage_percent', 0.0):g}")
+        self._update_estimated_h()
         self.resistors = list(cfg.resistors)
         self._refresh_resistor_tree()
 
