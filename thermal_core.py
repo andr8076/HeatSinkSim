@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v8_gui.py
+thermal_plate_sim_v9_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
-Adds live layout preview, advanced cooling, heatsink support, even-spread banks, and a deeper multi-worker optimizer.
+Adds live layout preview, advanced cooling, geometry heatsink builder, even-spread banks, and a deeper multi-worker optimizer.
 
 Features:
   - Tkinter UI
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v8_gui.py
+  python3 thermal_plate_sim_v9_gui.py
 """
 
 from __future__ import annotations
@@ -127,6 +127,22 @@ class PlateConfig:
     heatsink_efficiency_percent: float = 70.0
     heatsink_h_multiplier: float = 1.0
     heatsink_notes: str = ""
+
+    # Geometry heatsink builder. This models fins as actual fin strips placed
+    # on the back side of the base plate. Resistors are assumed to be mounted
+    # on the flat/front side.
+    #
+    # Orientation:
+    #   run_y = fins run along plate Y/height, positions spread across X/width
+    #   run_x = fins run along plate X/width, positions spread across Y/height
+    heatsink_geometry_enabled: bool = False
+    heatsink_fin_orientation: str = "run_y"
+    heatsink_fin_count: int = 0
+    heatsink_fin_thickness_mm: float = 0.0  # 0 = same as base plate thickness
+    heatsink_fin_default_height_mm: float = 30.0
+    heatsink_fin_run_length_cm: float = 0.0  # 0 = full available plate dimension
+    heatsink_fin_positions_cm: str = "even"  # "even" or comma-separated centers
+    heatsink_fin_heights_mm: str = "same"    # "same" or comma-separated heights
 
 
 @dataclass
@@ -219,12 +235,198 @@ def safe_time_name(label: str) -> str:
     )
 
 
-def effective_convection_h_for_solver(cfg: "PlateConfig") -> float:
-    """Return the equivalent h value used by the solver.
 
-    A heatsink/finned surface is approximated as extra effective exposed area.
-    This keeps the UI simple and works best for a heatsink attached broadly to
-    the plate, not a tiny local heatsink.
+def _parse_number_list(text: str) -> List[float]:
+    raw = str(text or "").strip().lower()
+    if raw in ("", "even", "same", "auto"):
+        return []
+    out: List[float] = []
+    for part in re.split(r"[;,\n]+", raw):
+        part = part.strip().replace(",", ".")
+        if not part:
+            continue
+        out.append(float(part))
+    return out
+
+
+def _value_or_default(value: float, default: float) -> float:
+    try:
+        value = float(value)
+    except Exception:
+        return default
+    return default if value <= 0 else value
+
+
+def heatsink_fin_specs(cfg: "PlateConfig") -> List[Dict]:
+    """Return calculated fin geometry from the heatsink builder settings.
+
+    Each fin is a rectangular vertical strip attached to the back of the base
+    plate. The dimensions define the geometry; the only environmental input is
+    the same convection h used for the rest of the plate.
+    """
+    if not getattr(cfg, "heatsink_enabled", False):
+        return []
+    if not getattr(cfg, "heatsink_geometry_enabled", False):
+        return []
+
+    count = int(max(0, round(float(getattr(cfg, "heatsink_fin_count", 0) or 0))))
+    if count <= 0:
+        return []
+
+    orientation = str(getattr(cfg, "heatsink_fin_orientation", "run_y") or "run_y").lower()
+    if orientation not in ("run_y", "run_x"):
+        orientation = "run_y"
+
+    plate_x_cm = max(0.001, float(cfg.plate_length_cm))
+    plate_y_cm = max(0.001, float(cfg.plate_width_cm))
+    base_t_mm = max(0.001, float(cfg.plate_thickness_mm))
+    fin_t_mm = _value_or_default(getattr(cfg, "heatsink_fin_thickness_mm", 0.0), base_t_mm)
+    default_h_mm = max(0.001, float(getattr(cfg, "heatsink_fin_default_height_mm", 30.0) or 30.0))
+
+    requested_run_cm = float(getattr(cfg, "heatsink_fin_run_length_cm", 0.0) or 0.0)
+    full_run_cm = plate_y_cm if orientation == "run_y" else plate_x_cm
+    run_len_cm = full_run_cm if requested_run_cm <= 0 else min(full_run_cm, requested_run_cm)
+
+    heights = _parse_number_list(getattr(cfg, "heatsink_fin_heights_mm", "same"))
+    if not heights:
+        heights = [default_h_mm] * count
+    elif len(heights) < count:
+        heights = heights + [heights[-1]] * (count - len(heights))
+    else:
+        heights = heights[:count]
+    heights = [max(0.001, float(h)) for h in heights]
+
+    positions = _parse_number_list(getattr(cfg, "heatsink_fin_positions_cm", "even"))
+    across_cm = plate_x_cm if orientation == "run_y" else plate_y_cm
+    half_fin_t_cm = fin_t_mm / 20.0
+    min_pos = -across_cm / 2.0 + half_fin_t_cm
+    max_pos = across_cm / 2.0 - half_fin_t_cm
+
+    if not positions:
+        if count == 1:
+            positions = [0.0]
+        else:
+            positions = list(np.linspace(min_pos, max_pos, count))
+    elif len(positions) < count:
+        remaining = count - len(positions)
+        fillers = [0.0] if remaining == 1 else list(np.linspace(min_pos, max_pos, remaining))
+        positions = positions + fillers
+    else:
+        positions = positions[:count]
+    positions = [min(max_pos, max(min_pos, float(x))) for x in positions]
+
+    specs: List[Dict] = []
+    for i in range(count):
+        pos = positions[i]
+        height_mm = heights[i]
+        if orientation == "run_y":
+            x_cm = pos
+            y_cm = 0.0
+            footprint_x_cm = fin_t_mm / 10.0
+            footprint_y_cm = run_len_cm
+        else:
+            x_cm = 0.0
+            y_cm = pos
+            footprint_x_cm = run_len_cm
+            footprint_y_cm = fin_t_mm / 10.0
+
+        run_m = run_len_cm / 100.0
+        thick_m = fin_t_mm / 1000.0
+        height_m = height_mm / 1000.0
+        # Exposed fin area: two broad faces + two end faces + tip.
+        # The base contact face is not exposed.
+        raw_area_m2 = 2.0 * run_m * height_m + 2.0 * thick_m * height_m + run_m * thick_m
+        footprint_m2 = run_m * thick_m
+
+        specs.append({
+            "index": i + 1,
+            "orientation": orientation,
+            "center_x_cm": x_cm,
+            "center_y_cm": y_cm,
+            "position_cm": pos,
+            "run_length_cm": run_len_cm,
+            "thickness_mm": fin_t_mm,
+            "height_mm": height_mm,
+            "footprint_x_cm": footprint_x_cm,
+            "footprint_y_cm": footprint_y_cm,
+            "raw_area_m2": raw_area_m2,
+            "footprint_m2": footprint_m2,
+        })
+
+    return specs
+
+
+def fin_efficiency_for_spec(cfg: "PlateConfig", spec: Dict) -> float:
+    """Classic straight rectangular fin efficiency.
+
+    eta = tanh(m*Lc)/(m*Lc)
+    m = sqrt(h*P/(k*A_c))
+
+    This removes manual fin-efficiency guessing. The remaining environmental
+    uncertainty is the convection h value.
+    """
+    h = max(0.05, float(cfg.convection_h_w_m2k))
+    k = max(0.1, float(cfg.thermal_conductivity_w_mk))
+    run_m = max(1e-9, spec["run_length_cm"] / 100.0)
+    thick_m = max(1e-9, spec["thickness_mm"] / 1000.0)
+    height_m = max(1e-9, spec["height_mm"] / 1000.0)
+
+    area_c = thick_m * run_m
+    perimeter = 2.0 * (run_m + thick_m)
+    m = math.sqrt(h * perimeter / (k * area_c))
+    corrected_length = height_m + thick_m / 2.0
+    ml = m * corrected_length
+    if ml <= 1e-12:
+        return 1.0
+    return max(0.0, min(1.0, math.tanh(ml) / ml))
+
+
+def heatsink_geometry_summary(cfg: "PlateConfig") -> Dict:
+    specs = heatsink_fin_specs(cfg)
+    raw_area_cm2 = 0.0
+    effective_fin_area_cm2 = 0.0
+    footprint_cm2 = 0.0
+    effective_extra_cm2 = 0.0
+    effs = []
+
+    for spec in specs:
+        eta = fin_efficiency_for_spec(cfg, spec)
+        raw = spec["raw_area_m2"] * 10000.0
+        foot = spec["footprint_m2"] * 10000.0
+        raw_area_cm2 += raw
+        footprint_cm2 += foot
+        effective_fin_area_cm2 += eta * raw
+        effective_extra_cm2 += max(0.0, eta * raw - foot)
+        effs.append(eta)
+
+    return {
+        "enabled": bool(specs),
+        "fin_count": len(specs),
+        "raw_fin_area_cm2": raw_area_cm2,
+        "effective_fin_area_cm2": effective_fin_area_cm2,
+        "footprint_area_cm2": footprint_cm2,
+        "effective_extra_area_cm2": effective_extra_cm2,
+        "average_fin_efficiency_percent": (100.0 * sum(effs) / len(effs)) if effs else 0.0,
+        "fins": specs,
+    }
+
+
+def heatsink_effective_extra_area_cm2(cfg: "PlateConfig") -> float:
+    if not getattr(cfg, "heatsink_enabled", False):
+        return 0.0
+    if getattr(cfg, "heatsink_geometry_enabled", False):
+        return float(heatsink_geometry_summary(cfg)["effective_extra_area_cm2"])
+    extra = max(0.0, getattr(cfg, "heatsink_extra_area_cm2", 0.0))
+    eff = max(0.0, min(100.0, getattr(cfg, "heatsink_efficiency_percent", 70.0))) / 100.0
+    hmul = max(0.0, getattr(cfg, "heatsink_h_multiplier", 1.0))
+    return extra * eff * hmul
+
+
+def effective_convection_h_for_solver(cfg: "PlateConfig") -> float:
+    """Return scalar h equivalent used for summaries/optimizer scoring.
+
+    The actual solver uses a spatial cooling-loss map when geometry fins are
+    enabled, so fin placement matters.
     """
     base_h = max(0.05, float(cfg.convection_h_w_m2k))
     if not getattr(cfg, "heatsink_enabled", False):
@@ -233,22 +435,57 @@ def effective_convection_h_for_solver(cfg: "PlateConfig") -> float:
     plate_l_m = max(1e-6, cfg.plate_length_cm / 100.0)
     plate_w_m = max(1e-6, cfg.plate_width_cm / 100.0)
     base_area_m2 = max(1e-9, 2.0 * plate_l_m * plate_w_m)
-
-    extra_area_m2 = max(0.0, getattr(cfg, "heatsink_extra_area_cm2", 0.0)) / 10000.0
-    eff = max(0.0, min(100.0, getattr(cfg, "heatsink_efficiency_percent", 70.0))) / 100.0
-    hmul = max(0.0, getattr(cfg, "heatsink_h_multiplier", 1.0))
-
-    effective_area_m2 = base_area_m2 + extra_area_m2 * eff * hmul
+    extra_area_m2 = heatsink_effective_extra_area_cm2(cfg) / 10000.0
+    effective_area_m2 = base_area_m2 + extra_area_m2
     return base_h * effective_area_m2 / base_area_m2
 
 
-def heatsink_effective_extra_area_cm2(cfg: "PlateConfig") -> float:
-    if not getattr(cfg, "heatsink_enabled", False):
-        return 0.0
-    extra = max(0.0, getattr(cfg, "heatsink_extra_area_cm2", 0.0))
-    eff = max(0.0, min(100.0, getattr(cfg, "heatsink_efficiency_percent", 70.0))) / 100.0
-    hmul = max(0.0, getattr(cfg, "heatsink_h_multiplier", 1.0))
-    return extra * eff * hmul
+def cooling_loss_coeff_map(cfg: "PlateConfig", shape: Tuple[int, int], dx_m: float, dy_m: float) -> np.ndarray:
+    """Return loss coefficient map in W/m²K for each plate cell.
+
+    For a plain plate, loss_coeff = 2*h because both large faces cool.
+    For geometry fins, fin cooling is applied locally under each fin footprint.
+    """
+    base_h = max(0.05, float(cfg.convection_h_w_m2k))
+
+    if getattr(cfg, "heatsink_enabled", False) and not getattr(cfg, "heatsink_geometry_enabled", False):
+        return np.full(shape, 2.0 * effective_convection_h_for_solver(cfg), dtype=float)
+
+    loss = np.full(shape, 2.0 * base_h, dtype=float)
+
+    if not (getattr(cfg, "heatsink_enabled", False) and getattr(cfg, "heatsink_geometry_enabled", False)):
+        return loss
+
+    nx, ny = shape
+    plate_l_m = cfg.plate_length_cm / 100.0
+    plate_w_m = cfg.plate_width_cm / 100.0
+    x = (np.arange(nx) + 0.5) * dx_m - plate_l_m / 2.0
+    y = (np.arange(ny) + 0.5) * dy_m - plate_w_m / 2.0
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    cell_area = dx_m * dy_m
+
+    for spec in heatsink_fin_specs(cfg):
+        cx = spec["center_x_cm"] / 100.0
+        cy = spec["center_y_cm"] / 100.0
+        hx = (spec["footprint_x_cm"] / 100.0) / 2.0
+        hy = (spec["footprint_y_cm"] / 100.0) / 2.0
+        mask = (X >= cx - hx) & (X <= cx + hx) & (Y >= cy - hy) & (Y <= cy + hy)
+        if not np.any(mask):
+            ix = int(np.argmin(np.abs(x - cx)))
+            iy = int(np.argmin(np.abs(y - cy)))
+            mask[ix, iy] = True
+
+        covered_area = float(np.count_nonzero(mask) * cell_area)
+        eta = fin_efficiency_for_spec(cfg, spec)
+        fin_conductance_w_k = base_h * eta * spec["raw_area_m2"]
+
+        # Base map already counted the back face under the fin. That area is
+        # replaced by fin conductance.
+        add_coeff = fin_conductance_w_k / max(1e-12, covered_area) - base_h
+        loss[mask] += add_coeff
+
+    return np.maximum(loss, 0.0)
+
 
 
 ORIENTATION_OPTIONS = {
@@ -449,12 +686,12 @@ def explicit_stability_dt(cfg: PlateConfig, dx_m: float, dy_m: float) -> float:
     rho = cfg.density_kg_m3
     cp = cfg.heat_capacity_j_kgk
     t = cfg.plate_thickness_mm / 1000.0
-    h = effective_convection_h_for_solver(cfg)
-
     alpha = k / (rho * cp)
-    beta = 2.0 * h / (rho * cp * t)
+    x_tmp, y_tmp, _, _ = build_grid(cfg)
+    loss = cooling_loss_coeff_map(cfg, (len(x_tmp), len(y_tmp)), dx_m, dy_m)
+    beta_max = float(np.max(loss)) / (rho * cp * t)
 
-    denom = 2.0 * alpha * ((1.0 / (dx_m * dx_m)) + (1.0 / (dy_m * dy_m))) + beta
+    denom = 2.0 * alpha * ((1.0 / (dx_m * dx_m)) + (1.0 / (dy_m * dy_m))) + beta_max
     return 0.45 / denom
 
 
@@ -476,13 +713,13 @@ def solve_steady_state(
     """
     k = cfg.thermal_conductivity_w_mk
     t = cfg.plate_thickness_mm / 1000.0
-    h = effective_convection_h_for_solver(cfg)
+    loss = cooling_loss_coeff_map(cfg, q_w_m2.shape, dx_m, dy_m)
 
     theta = np.zeros_like(q_w_m2, dtype=float)
 
     ax = k * t / (dx_m * dx_m)
     ay = k * t / (dy_m * dy_m)
-    center = 2.0 * ax + 2.0 * ay + 2.0 * h
+    center = 2.0 * ax + 2.0 * ay + loss
 
     converged = False
     final_diff = None
@@ -535,10 +772,10 @@ def run_simulation(
     cp = cfg.heat_capacity_j_kgk
     t_m = cfg.plate_thickness_mm / 1000.0
     k = cfg.thermal_conductivity_w_mk
-    h = effective_convection_h_for_solver(cfg)
+    loss = cooling_loss_coeff_map(cfg, q_w_m2.shape, dx_m, dy_m)
 
     alpha = k / (rho * cp)
-    beta = 2.0 * h / (rho * cp * t_m)
+    beta = loss / (rho * cp * t_m)
     source = q_w_m2 / (rho * cp * t_m)
 
     dt_stable = explicit_stability_dt(cfg, dx_m, dy_m)
@@ -682,9 +919,11 @@ def calculate_summary(
     total_power_w = sum(r.power_w for r in cfg.resistors)
 
     effective_h = effective_convection_h_for_solver(cfg)
-    simple_average_final_rise_c = total_power_w / (effective_h * top_bottom_area_m2)
+    loss_map = cooling_loss_coeff_map(cfg, q_w_m2.shape, dx_m, dy_m)
+    thermal_conductance_w_k = float(np.sum(loss_map * dx_m * dy_m))
+    simple_average_final_rise_c = total_power_w / max(1e-12, thermal_conductance_w_k)
 
-    tau_s = heat_capacity_j_c / (effective_h * top_bottom_area_m2)
+    tau_s = heat_capacity_j_c / max(1e-12, thermal_conductance_w_k)
     t90_s = -math.log(0.10) * tau_s
     t95_s = -math.log(0.05) * tau_s
 
@@ -701,7 +940,7 @@ def calculate_summary(
             "avg_temp_c": float(np.mean(temp)),
             "max_temp_c": float(np.max(temp)),
             "min_temp_c": float(np.min(temp)),
-            "convective_loss_w": float(np.sum(2.0 * effective_h * theta * cell_area)),
+            "convective_loss_w": float(np.sum(loss_map * theta * cell_area)),
         }
 
         for r, mask, covered_area_m2 in resistor_masks:
@@ -735,6 +974,8 @@ def calculate_summary(
         "heatsink_enabled": getattr(cfg, "heatsink_enabled", False),
         "heatsink_raw_extra_area_cm2": getattr(cfg, "heatsink_extra_area_cm2", 0.0),
         "heatsink_effective_extra_area_cm2": heatsink_effective_extra_area_cm2(cfg),
+        "heatsink_geometry": heatsink_geometry_summary(cfg),
+        "thermal_conductance_w_per_k": thermal_conductance_w_k,
         "simple_average_final_rise_c": simple_average_final_rise_c,
         "tau_s": tau_s,
         "t90_s": t90_s,

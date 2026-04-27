@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v8_gui.py
+thermal_plate_sim_v9_gui.py
 
-A cleaner tabbed UI for the thermal plate simulator with heatsink support and multi-worker optimization.
+A cleaner tabbed UI for the thermal plate simulator with geometry heatsink builder and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
 
 Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v8_gui.py
+    python thermal_plate_sim_v9_gui.py
 """
 
 from __future__ import annotations
@@ -46,7 +46,10 @@ from thermal_core import (
     display_from_key,
     estimate_passive_h,
     evenly_spaced_positions,
+    fin_efficiency_for_spec,
     format_time,
+    heatsink_fin_specs,
+    heatsink_geometry_summary,
     key_from_display,
     optimize_layout_deep,
     parse_float,
@@ -60,7 +63,7 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v8")
+        self.title("Thermal Plate Simulator v9")
         self.geometry("1320x840")
         self.minsize(1120, 720)
 
@@ -127,9 +130,17 @@ class ThermalPlateGUI(tk.Tk):
         self.cooling_notes = "manual h"
 
         self.heatsink_enabled_var = tk.BooleanVar(value=False)
+        self.heatsink_mode_var = tk.StringVar(value="Geometry builder")
         self.heatsink_area_var = tk.StringVar(value="0")
         self.heatsink_eff_var = tk.StringVar(value="70")
         self.heatsink_hmul_var = tk.StringVar(value="1.0")
+        self.heatsink_fin_orientation_var = tk.StringVar(value="Fins run along Y, spread across X")
+        self.heatsink_fin_count_var = tk.StringVar(value="8")
+        self.heatsink_fin_thickness_var = tk.StringVar(value="same")
+        self.heatsink_fin_height_var = tk.StringVar(value="30")
+        self.heatsink_fin_run_length_var = tk.StringVar(value="full")
+        self.heatsink_fin_positions_var = tk.StringVar(value="even")
+        self.heatsink_fin_heights_var = tk.StringVar(value="same")
         self.heatsink_label_var = tk.StringVar(value="No heatsink / extra fins")
 
         self.r_name_var = tk.StringVar(value="R1")
@@ -404,8 +415,13 @@ Always run the full simulation after optimizing.
             var.trace_add("write", lambda *a: self._schedule_preview())
         for var in [self.advanced_cooling_var,self.orientation_var,self.environment_var,self.clearance_var,self.surface_var,self.air_movement_var,self.hot_air_path_var,self.blockage_var]:
             var.trace_add("write", lambda *a: self._update_h_label())
-        for var in [self.heatsink_enabled_var,self.heatsink_area_var,self.heatsink_eff_var,self.heatsink_hmul_var]:
-            var.trace_add("write", lambda *a: self._update_heatsink_label())
+        for var in [
+            self.heatsink_enabled_var,self.heatsink_mode_var,self.heatsink_area_var,self.heatsink_eff_var,self.heatsink_hmul_var,
+            self.heatsink_fin_orientation_var,self.heatsink_fin_count_var,self.heatsink_fin_thickness_var,
+            self.heatsink_fin_height_var,self.heatsink_fin_run_length_var,self.heatsink_fin_positions_var,
+            self.heatsink_fin_heights_var
+        ]:
+            var.trace_add("write", lambda *a: (self._update_heatsink_label(), self._schedule_preview()))
 
     def _schedule_preview(self):
         if not self._live_preview_ready: return
@@ -461,31 +477,138 @@ Always run the full simulation after optimizing.
         ttk.Label(f,textvariable=self.h_label_var,foreground="#555",wraplength=420).grid(row=8,column=0,columnspan=2,sticky="w",pady=(10,0))
         ttk.Button(f,text="Close",command=win.destroy).grid(row=9,column=0,columnspan=2,sticky="ew",pady=(12,0))
 
+    def _heatsink_orientation_key(self) -> str:
+        return "run_x" if "along X" in self.heatsink_fin_orientation_var.get() else "run_y"
+
+    def _float_or_zero_for_full_same(self, value: str, default: float = 0.0) -> float:
+        raw = str(value or "").strip().lower()
+        if raw in ("", "same", "full", "auto"):
+            return default
+        return parse_float(raw, "value", 0.0)
+
     def _update_heatsink_label(self):
         try:
             if not self.heatsink_enabled_var.get():
                 self.heatsink_label_var.set("No heatsink / extra fins")
                 return
-            area=parse_float(self.heatsink_area_var.get(),"Heatsink area",0.0)
-            eff=parse_float(self.heatsink_eff_var.get(),"Heatsink efficiency",0.0)
-            hmul=parse_float(self.heatsink_hmul_var.get(),"Heatsink h multiplier",0.0)
-            effective=area*max(0,min(100,eff))/100*hmul
-            self.heatsink_label_var.set(f"Extra effective area ≈ {effective:.0f} cm²")
+
+            if self.heatsink_mode_var.get().startswith("Geometry"):
+                cfg = self._read_config_loose_for_heatsink()
+                summary = heatsink_geometry_summary(cfg)
+                if not summary["enabled"]:
+                    self.heatsink_label_var.set("Geometry heatsink enabled, but no fins calculated")
+                    return
+                self.heatsink_label_var.set(
+                    f"{summary['fin_count']} fins, raw area {summary['raw_fin_area_cm2']:.0f} cm², "
+                    f"effective extra ≈ {summary['effective_extra_area_cm2']:.0f} cm², "
+                    f"avg fin η {summary['average_fin_efficiency_percent']:.0f}%"
+                )
+            else:
+                area=parse_float(self.heatsink_area_var.get(),"Heatsink area",0.0)
+                eff=parse_float(self.heatsink_eff_var.get(),"Heatsink efficiency",0.0)
+                hmul=parse_float(self.heatsink_hmul_var.get(),"Heatsink h multiplier",0.0)
+                effective=area*max(0,min(100,eff))/100*hmul
+                self.heatsink_label_var.set(f"Simple extra effective area ≈ {effective:.0f} cm²")
         except Exception as e:
             self.heatsink_label_var.set(f"Heatsink error: {e}")
 
+    def _read_config_loose_for_heatsink(self) -> PlateConfig:
+        """Read just enough config for heatsink preview/summary without requiring a full run."""
+        h = parse_float(self.h_var.get(), "h", 0.1)
+        if self.advanced_cooling_var.get():
+            try:
+                h, _ = estimate_passive_h(
+                    orientation=key_from_display(__import__('thermal_core').ORIENTATION_OPTIONS,self.orientation_var.get()),
+                    environment=key_from_display(__import__('thermal_core').ENVIRONMENT_OPTIONS,self.environment_var.get()),
+                    wall_clearance_cm=parse_float(self.clearance_var.get(),"Wall clearance",0.0),
+                    surface_finish=key_from_display(__import__('thermal_core').SURFACE_OPTIONS,self.surface_var.get()),
+                    air_movement=key_from_display(__import__('thermal_core').AIR_MOVEMENT_OPTIONS,self.air_movement_var.get()),
+                    hot_air_path=key_from_display(__import__('thermal_core').HOT_AIR_PATH_OPTIONS,self.hot_air_path_var.get()),
+                    blockage_percent=parse_float(self.blockage_var.get(),"Blockage",0.0),
+                )
+            except Exception:
+                pass
+
+        fin_t = self._float_or_zero_for_full_same(self.heatsink_fin_thickness_var.get(), 0.0)
+        run_len = self._float_or_zero_for_full_same(self.heatsink_fin_run_length_var.get(), 0.0)
+
+        return PlateConfig(
+            plate_length_cm=parse_float(self.plate_width_x_var.get(),"Plate width",0.1),
+            plate_width_cm=parse_float(self.plate_height_y_var.get(),"Plate height",0.1),
+            plate_thickness_mm=parse_float(self.plate_thickness_var.get(),"Thickness",0.1),
+            material_name=self.material_var.get(),
+            thermal_conductivity_w_mk=parse_float(self.k_var.get(),"k",0.1),
+            density_kg_m3=parse_float(self.rho_var.get(),"Density",1.0),
+            heat_capacity_j_kgk=parse_float(self.cp_var.get(),"Heat capacity",1.0),
+            ambient_c=parse_float(self.ambient_var.get(),"Ambient"),
+            convection_h_w_m2k=h,
+            grid_mm=max(1.0, self._float_or_zero_for_full_same(self.grid_var.get(), 5.0)),
+            resistors=list(self.resistors) if self.resistors else [Resistor("R1", 0, 0, 0, 10, 10)],
+            initial_plate_temp_c=parse_float(self.initial_temp_var.get(),"Initial"),
+            max_time_s=60.0,
+            snapshot_every_s=60.0,
+            include_steady_state=False,
+            heatsink_enabled=bool(self.heatsink_enabled_var.get()),
+            heatsink_geometry_enabled=self.heatsink_mode_var.get().startswith("Geometry"),
+            heatsink_fin_orientation=self._heatsink_orientation_key(),
+            heatsink_fin_count=int(parse_float(self.heatsink_fin_count_var.get(),"Fin count",0)),
+            heatsink_fin_thickness_mm=fin_t,
+            heatsink_fin_default_height_mm=parse_float(self.heatsink_fin_height_var.get(),"Fin height",0.1),
+            heatsink_fin_run_length_cm=run_len,
+            heatsink_fin_positions_cm=self.heatsink_fin_positions_var.get(),
+            heatsink_fin_heights_mm=self.heatsink_fin_heights_var.get(),
+            heatsink_extra_area_cm2=parse_float(self.heatsink_area_var.get(),"Heatsink extra area",0.0),
+            heatsink_efficiency_percent=parse_float(self.heatsink_eff_var.get(),"Heatsink efficiency",0.0),
+            heatsink_h_multiplier=parse_float(self.heatsink_hmul_var.get(),"Heatsink h multiplier",0.0),
+        )
+
     def _heatsink_dialog(self):
-        win=tk.Toplevel(self); win.title("Heatsink / fins"); win.transient(self); win.grab_set()
+        win=tk.Toplevel(self); win.title("Heatsink builder"); win.transient(self); win.grab_set()
         f=ttk.Frame(win,padding=12); f.grid(row=0,column=0,sticky="nsew"); f.columnconfigure(1,weight=1)
-        ttk.Checkbutton(f,text="Enable heatsink / extra fins",variable=self.heatsink_enabled_var,command=self._update_heatsink_label).grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,8))
-        self._entry_row(f,1,"Extra exposed area cm²",self.heatsink_area_var)
-        self._entry_row(f,2,"Fin efficiency %",self.heatsink_eff_var)
-        self._entry_row(f,3,"h multiplier",self.heatsink_hmul_var)
-        ttk.Label(f,textvariable=self.heatsink_label_var,foreground="#555",wraplength=420).grid(row=4,column=0,columnspan=2,sticky="w",pady=(10,0))
-        ttk.Label(f,text="Simple model: adds effective surface area to the whole plate. Best for fins or a heatsink broadly attached to the plate. For narrow fins or poor airflow, reduce efficiency or h multiplier.",foreground="#555",wraplength=420,justify="left").grid(row=5,column=0,columnspan=2,sticky="w",pady=(8,0))
+        ttk.Checkbutton(f,text="Enable heatsink / fins",variable=self.heatsink_enabled_var,command=self._update_heatsink_label).grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,8))
+
+        ttk.Label(f,text="Mode").grid(row=1,column=0,sticky="w",pady=3)
+        ttk.Combobox(f,textvariable=self.heatsink_mode_var,values=["Geometry builder","Simple extra area"],state="readonly",width=30).grid(row=1,column=1,sticky="ew",pady=3)
+
+        geom=ttk.LabelFrame(f,text="Geometry builder: fins on back, resistors on flat/front side",padding=8)
+        geom.grid(row=2,column=0,columnspan=2,sticky="ew",pady=(8,8)); geom.columnconfigure(1,weight=1)
+        ttk.Label(geom,text="Orientation").grid(row=0,column=0,sticky="w",pady=2)
+        ttk.Combobox(
+            geom,
+            textvariable=self.heatsink_fin_orientation_var,
+            values=["Fins run along Y, spread across X","Fins run along X, spread across Y"],
+            state="readonly",
+            width=34
+        ).grid(row=0,column=1,sticky="ew",pady=2)
+        self._entry_row(geom,1,"Number of fins",self.heatsink_fin_count_var)
+        self._entry_row(geom,2,"Fin thickness mm",self.heatsink_fin_thickness_var)
+        self._entry_row(geom,3,"Default fin height mm",self.heatsink_fin_height_var)
+        self._entry_row(geom,4,"Fin run length cm",self.heatsink_fin_run_length_var)
+        self._entry_row(geom,5,"Fin positions cm",self.heatsink_fin_positions_var)
+        self._entry_row(geom,6,"Individual heights mm",self.heatsink_fin_heights_var)
+        ttk.Label(
+            geom,
+            text="Use 'same' for fin thickness to match the base plate. Use 'full' for run length to span the plate. "
+                 "Positions: 'even' or comma-separated centers. Heights: 'same' or comma-separated values.",
+            foreground="#555",wraplength=420,justify="left"
+        ).grid(row=7,column=0,columnspan=2,sticky="w",pady=(8,0))
+
+        simple=ttk.LabelFrame(f,text="Simple area fallback",padding=8)
+        simple.grid(row=3,column=0,columnspan=2,sticky="ew",pady=(0,8)); simple.columnconfigure(1,weight=1)
+        self._entry_row(simple,0,"Extra exposed area cm²",self.heatsink_area_var)
+        self._entry_row(simple,1,"Manual efficiency %",self.heatsink_eff_var)
+        self._entry_row(simple,2,"h multiplier",self.heatsink_hmul_var)
+
+        ttk.Label(f,textvariable=self.heatsink_label_var,foreground="#555",wraplength=460).grid(row=4,column=0,columnspan=2,sticky="w",pady=(10,0))
+        ttk.Label(
+            f,
+            text="Geometry mode calculates fin area and fin efficiency from the dimensions. The remaining assumption is still the airflow/cooling h value, because passive air cannot be known exactly without measurement or CFD.",
+            foreground="#555",wraplength=460,justify="left"
+        ).grid(row=5,column=0,columnspan=2,sticky="w",pady=(8,0))
         ttk.Button(f,text="Close",command=win.destroy).grid(row=6,column=0,columnspan=2,sticky="ew",pady=(12,0))
         self._update_heatsink_label()
 
+    # ----------------------------- config/read -----------------------------
     # ----------------------------- config/read -----------------------------
     def _read_config(self) -> PlateConfig:
         cfg=PlateConfig(
@@ -518,6 +641,14 @@ Always run the full simulation after optimizing.
             heatsink_efficiency_percent=parse_float(self.heatsink_eff_var.get(),"Heatsink efficiency",0.0),
             heatsink_h_multiplier=parse_float(self.heatsink_hmul_var.get(),"Heatsink h multiplier",0.0),
             heatsink_notes=self.heatsink_label_var.get(),
+            heatsink_geometry_enabled=self.heatsink_mode_var.get().startswith("Geometry"),
+            heatsink_fin_orientation=self._heatsink_orientation_key(),
+            heatsink_fin_count=int(parse_float(self.heatsink_fin_count_var.get(),"Fin count",0)),
+            heatsink_fin_thickness_mm=self._float_or_zero_for_full_same(self.heatsink_fin_thickness_var.get(),0.0),
+            heatsink_fin_default_height_mm=parse_float(self.heatsink_fin_height_var.get(),"Fin height",0.1),
+            heatsink_fin_run_length_cm=self._float_or_zero_for_full_same(self.heatsink_fin_run_length_var.get(),0.0),
+            heatsink_fin_positions_cm=self.heatsink_fin_positions_var.get(),
+            heatsink_fin_heights_mm=self.heatsink_fin_heights_var.get(),
         )
         if cfg.snapshot_every_s > cfg.max_time_s: raise ValueError("Snapshot interval cannot be greater than max time.")
         if not cfg.resistors: raise ValueError("Add at least one resistor.")
@@ -573,6 +704,17 @@ Always run the full simulation after optimizing.
             self.fig.clear(); self.ax=self.fig.add_subplot(111); self.colorbar=None
             self.ax.set_aspect("equal", adjustable="box"); self.ax.set_xlim(-px/2,px/2); self.ax.set_ylim(-py/2,py/2)
             self.ax.add_patch(Rectangle((-px/2,-py/2),px,py,fill=False,linewidth=2))
+
+            # Blue dashed strips show heatsink fin footprints on the back side.
+            try:
+                if self.heatsink_enabled_var.get() and self.heatsink_mode_var.get().startswith("Geometry"):
+                    cfg_preview = self._read_config_loose_for_heatsink()
+                    for fin in heatsink_fin_specs(cfg_preview):
+                        fx=fin["center_x_cm"]; fy=fin["center_y_cm"]; fw=fin["footprint_x_cm"]; fh=fin["footprint_y_cm"]
+                        self.ax.add_patch(Rectangle((fx-fw/2,fy-fh/2),fw,fh,fill=False,linestyle="--",linewidth=1.4))
+            except Exception:
+                pass
+
             for r in self.resistors:
                 l=r.length_mm/10; w=r.width_mm/10
                 self.ax.add_patch(Rectangle((r.center_x_cm-l/2,r.center_y_cm-w/2),l,w,fill=True,alpha=0.25,linewidth=2))
@@ -660,11 +802,19 @@ Always run the full simulation after optimizing.
         lines.append("Positions applied. Run full simulation for final result."); self._set_status("\n".join(lines)); self._draw_layout_preview()
 
     # ------------------------------- summary/tools -------------------------------
+    def _heatsink_summary_line(self, s: Dict) -> str:
+        hs=s.get('heatsink_geometry') or {}
+        if hs.get('enabled'):
+            return (
+                f"Geometry fins: {hs.get('fin_count',0)} fins, raw {hs.get('raw_fin_area_cm2',0):.0f} cm², "
+                f"avg η {hs.get('average_fin_efficiency_percent',0):.0f}%"
+            )
+        return "Geometry fins: off"
     def _write_summary(self,result):
         s=result.summary; snap=result.snapshots[-1]; temp=snap.temp_c; max_plate=float(np.max(temp)); avg_plate=float(np.mean(temp))
         max_lim=self._f(self.max_plate_temp_var.get(),90); case_lim=self._f(self.max_res_case_temp_var.get(),120); extra=self._f(self.extra_cw_var.get(),0.5); margin=self._f(self.cooling_margin_var.get(),25)
         safe_h=result.cfg.convection_h_w_m2k*(1-max(0,min(90,margin))/100); conservative=result.cfg.ambient_c+s['total_power_w']/(max(.1,safe_h)*(s['plate_area_both_faces_cm2']/10000))
-        lines=["Simulation complete.","",f"Grid: {s['grid_cells_x']} × {s['grid_cells_y']}",f"Total heat: {s['total_power_w']:.2f} W",f"Plate area both faces: {s['plate_area_both_faces_cm2']:.0f} cm²",f"Base h: {s.get('base_h_w_m2k',result.cfg.convection_h_w_m2k):.2f} W/m²K",f"Effective h used: {s.get('effective_convection_h_w_m2k',result.cfg.convection_h_w_m2k):.2f} W/m²K",f"Heatsink effective extra area: {s.get('heatsink_effective_extra_area_cm2',0):.0f} cm²",f"Final endpoint: {snap.label}",f"Average plate temp: {avg_plate:.1f} °C",f"Max plate temp: {max_plate:.1f} °C","","Pass/fail:"]
+        lines=["Simulation complete.","",f"Grid: {s['grid_cells_x']} × {s['grid_cells_y']}",f"Total heat: {s['total_power_w']:.2f} W",f"Plate area both faces: {s['plate_area_both_faces_cm2']:.0f} cm²",f"Base h: {s.get('base_h_w_m2k',result.cfg.convection_h_w_m2k):.2f} W/m²K",f"Effective h used: {s.get('effective_convection_h_w_m2k',result.cfg.convection_h_w_m2k):.2f} W/m²K",f"Heatsink effective extra area: {s.get('heatsink_effective_extra_area_cm2',0):.0f} cm²",self._heatsink_summary_line(s),f"Final endpoint: {snap.label}",f"Average plate temp: {avg_plate:.1f} °C",f"Max plate temp: {max_plate:.1f} °C","","Pass/fail:"]
         lines.append(f"  Plate: {'PASS' if max_plate<=max_lim else 'WARNING' if max_plate<=max_lim+15 else 'FAIL'} ({max_plate:.1f} °C vs limit {max_lim:.1f} °C)")
         lines.append(f"  Conservative average with {margin:.0f}% h margin: {conservative:.1f} °C")
         lines.append(""); lines.append("Resistor footprint / estimated case:")
@@ -727,7 +877,7 @@ Always run the full simulation after optimizing.
             self._append_status(f"Loaded config: {path}")
         except Exception as e: messagebox.showerror("Load failed",str(e))
     def _apply_config(self,cfg):
-        self.plate_width_x_var.set(f"{cfg.plate_length_cm:g}"); self.plate_height_y_var.set(f"{cfg.plate_width_cm:g}"); self.plate_thickness_var.set(f"{cfg.plate_thickness_mm:g}"); self.material_var.set(cfg.material_name); self.k_var.set(f"{cfg.thermal_conductivity_w_mk:g}"); self.rho_var.set(f"{cfg.density_kg_m3:g}"); self.cp_var.set(f"{cfg.heat_capacity_j_kgk:g}"); self.ambient_var.set(f"{cfg.ambient_c:g}"); self.h_var.set(f"{cfg.convection_h_w_m2k:g}"); self.grid_var.set(f"{cfg.grid_mm:g}"); self.initial_temp_var.set(f"{cfg.initial_plate_temp_c:g}"); self.max_time_var.set(format_time(cfg.max_time_s).replace(' ','')); self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(' ','')); self.include_steady_var.set(cfg.include_steady_state); self.advanced_cooling_var.set(getattr(cfg,'advanced_cooling_enabled',False)); self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS,getattr(cfg,'orientation','vertical'))); self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS,getattr(cfg,'environment','open_air'))); self.clearance_var.set(f"{getattr(cfg,'wall_clearance_cm',20):g}"); self.surface_var.set(display_from_key(SURFACE_OPTIONS,getattr(cfg,'surface_finish','bare_metal'))); self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS,getattr(cfg,'air_movement','still_air'))); self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS,getattr(cfg,'hot_air_path','free_rise'))); self.blockage_var.set(f"{getattr(cfg,'blockage_percent',0):g}"); self.heatsink_enabled_var.set(getattr(cfg,'heatsink_enabled',False)); self.heatsink_area_var.set(f"{getattr(cfg,'heatsink_extra_area_cm2',0):g}"); self.heatsink_eff_var.set(f"{getattr(cfg,'heatsink_efficiency_percent',70):g}"); self.heatsink_hmul_var.set(f"{getattr(cfg,'heatsink_h_multiplier',1):g}"); self.resistors=list(cfg.resistors); self._refresh_resistor_tree(); self._update_material_fields(); self._update_h_label(); self._update_heatsink_label(); self._draw_layout_preview()
+        self.plate_width_x_var.set(f"{cfg.plate_length_cm:g}"); self.plate_height_y_var.set(f"{cfg.plate_width_cm:g}"); self.plate_thickness_var.set(f"{cfg.plate_thickness_mm:g}"); self.material_var.set(cfg.material_name); self.k_var.set(f"{cfg.thermal_conductivity_w_mk:g}"); self.rho_var.set(f"{cfg.density_kg_m3:g}"); self.cp_var.set(f"{cfg.heat_capacity_j_kgk:g}"); self.ambient_var.set(f"{cfg.ambient_c:g}"); self.h_var.set(f"{cfg.convection_h_w_m2k:g}"); self.grid_var.set(f"{cfg.grid_mm:g}"); self.initial_temp_var.set(f"{cfg.initial_plate_temp_c:g}"); self.max_time_var.set(format_time(cfg.max_time_s).replace(' ','')); self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(' ','')); self.include_steady_var.set(cfg.include_steady_state); self.advanced_cooling_var.set(getattr(cfg,'advanced_cooling_enabled',False)); self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS,getattr(cfg,'orientation','vertical'))); self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS,getattr(cfg,'environment','open_air'))); self.clearance_var.set(f"{getattr(cfg,'wall_clearance_cm',20):g}"); self.surface_var.set(display_from_key(SURFACE_OPTIONS,getattr(cfg,'surface_finish','bare_metal'))); self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS,getattr(cfg,'air_movement','still_air'))); self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS,getattr(cfg,'hot_air_path','free_rise'))); self.blockage_var.set(f"{getattr(cfg,'blockage_percent',0):g}"); self.heatsink_enabled_var.set(getattr(cfg,'heatsink_enabled',False)); self.heatsink_mode_var.set("Geometry builder" if getattr(cfg,'heatsink_geometry_enabled',False) else "Simple extra area"); self.heatsink_area_var.set(f"{getattr(cfg,'heatsink_extra_area_cm2',0):g}"); self.heatsink_eff_var.set(f"{getattr(cfg,'heatsink_efficiency_percent',70):g}"); self.heatsink_hmul_var.set(f"{getattr(cfg,'heatsink_h_multiplier',1):g}"); self.heatsink_fin_orientation_var.set("Fins run along X, spread across Y" if getattr(cfg,'heatsink_fin_orientation','run_y')=='run_x' else "Fins run along Y, spread across X"); self.heatsink_fin_count_var.set(f"{getattr(cfg,'heatsink_fin_count',0):g}"); self.heatsink_fin_thickness_var.set("same" if getattr(cfg,'heatsink_fin_thickness_mm',0)<=0 else f"{getattr(cfg,'heatsink_fin_thickness_mm',0):g}"); self.heatsink_fin_height_var.set(f"{getattr(cfg,'heatsink_fin_default_height_mm',30):g}"); self.heatsink_fin_run_length_var.set("full" if getattr(cfg,'heatsink_fin_run_length_cm',0)<=0 else f"{getattr(cfg,'heatsink_fin_run_length_cm',0):g}"); self.heatsink_fin_positions_var.set(getattr(cfg,'heatsink_fin_positions_cm','even')); self.heatsink_fin_heights_var.set(getattr(cfg,'heatsink_fin_heights_mm','same')); self.resistors=list(cfg.resistors); self._refresh_resistor_tree(); self._update_material_fields(); self._update_h_label(); self._update_heatsink_label(); self._draw_layout_preview()
     def _current_snapshot(self):
         if self.result is None: return None
         idx=int(round(float(self.time_slider.get()))); return self.result.snapshots[idx] if 0<=idx<len(self.result.snapshots) else None
