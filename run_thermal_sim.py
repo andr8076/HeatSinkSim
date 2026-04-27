@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-platform launcher for Thermal Plate Simulator v10.
+Cross-platform launcher for Thermal Plate Simulator v11.
 
 It checks dependencies and starts the GUI. Works on Windows, macOS, and Linux.
 """
@@ -13,7 +13,7 @@ import subprocess
 import sys
 import traceback
 
-APP_FILE = "thermal_plate_sim_v10_gui.py"
+APP_FILE = "thermal_plate_sim_v11_gui.py"
 REQUIRED = ["numpy", "matplotlib"]
 
 
@@ -68,8 +68,8 @@ def main() -> int:
             return 1
 
     try:
-        import thermal_plate_sim_v10_gui
-        thermal_plate_sim_v10_gui.main()
+        import thermal_plate_sim_v11_gui
+        thermal_plate_sim_v11_gui.main()
         return 0
     except Exception:
         print("The simulator crashed during startup:")

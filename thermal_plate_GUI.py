@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v10_gui.py
+thermal_plate_sim_v11_gui.py
 
-Cross-platform thermal plate simulator with geometry heatsink builder and multi-worker optimization.
+Cross-platform thermal plate simulator with geometry heatsink builder, 3D heatmap viewer, and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
 
 Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v10_gui.py
+    python thermal_plate_sim_v11_gui.py
 """
 
 from __future__ import annotations
@@ -40,6 +40,9 @@ matplotlib.use("TkAgg", force=True)
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
+from matplotlib import cm
+from matplotlib.colors import Normalize
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from thermal_core import (
     AIR_MOVEMENT_OPTIONS,
@@ -72,7 +75,7 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v10")
+        self.title("Thermal Plate Simulator v11")
 
         # Cross-platform initial window sizing.
         # macOS laptops and smaller Linux/Windows screens can be shorter than
@@ -166,8 +169,8 @@ class ThermalPlateGUI(tk.Tk):
             help_menu.add_command(
                 label="About",
                 command=lambda: messagebox.showinfo(
-                    "Thermal Plate Simulator v10",
-                    "Thermal Plate Simulator v10\nCross-platform GUI for Windows, macOS, and Linux."
+                    "Thermal Plate Simulator v11",
+                    "Thermal Plate Simulator v11\nCross-platform GUI for Windows, macOS, and Linux."
                 )
             )
             menubar.add_cascade(label="Help", menu=help_menu)
@@ -242,6 +245,7 @@ class ThermalPlateGUI(tk.Tk):
         self.optimizer_depth_var = tk.StringVar(value="Deep")
         self.optimizer_grid_var = tk.StringVar(value="12")
         self.optimizer_workers_var = tk.StringVar(value="0")
+        self.resistor_side_var = tk.StringVar(value="Front / flat side")
 
         self.e_supply_v_var = tk.StringVar(value="28")
         self.e_res_ohm_var = tk.StringVar(value="1")
@@ -412,7 +416,9 @@ class ThermalPlateGUI(tk.Tk):
         for i,(lab,var) in enumerate(fields):
             ttk.Label(frame, text=lab).grid(row=1+i//2, column=(i%2)*2, sticky="w", pady=2)
             ttk.Entry(frame, textvariable=var, width=10).grid(row=1+i//2, column=(i%2)*2+1, sticky="ew", pady=2)
-        btn = ttk.Frame(frame); btn.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8,0))
+        ttk.Label(frame, text="3D display side").grid(row=4, column=0, sticky="w", pady=(8,2))
+        ttk.Combobox(frame, textvariable=self.resistor_side_var, values=["Front / flat side", "Back / fin side", "Both sides"], state="readonly", width=18).grid(row=4, column=1, columnspan=3, sticky="ew", pady=(8,2))
+        btn = ttk.Frame(frame); btn.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8,0))
         ttk.Button(btn, text="Add", command=self._add_res).pack(side="left", padx=(0,4))
         ttk.Button(btn, text="Update", command=self._update_res).pack(side="left", padx=(0,4))
         ttk.Button(btn, text="Delete", command=self._delete_res).pack(side="left")
@@ -501,6 +507,12 @@ Cooling margin % is only for the pass/fail interpretation.
 Optimizer
 Balanced is faster. Deep is the normal choice. Extreme searches harder and can take much longer.
 Always run the full simulation after optimizing.
+
+3D viewer
+Open 3D viewer after a simulation to see the heatmapped plate, back-side fins, and resistor blocks. The resistor side control is visual; the 2D thermal model is still through the same thin plate.
+
+Fin layout
+Use the heatsink dialog's Fin layout designer for individual fin positions and heights. Even fills the available width. Place fins near resistors clusters fins under/near heat sources along the fin spread axis.
 """.strip())
         t.configure(state="disabled")
 
@@ -517,6 +529,7 @@ Always run the full simulation after optimizing.
         ttk.Button(nav,text="Previous",command=lambda:self._step_slider(-1)).pack(side="left")
         ttk.Button(nav,text="Next",command=lambda:self._step_slider(1)).pack(side="left",padx=(4,0))
         ttk.Button(nav,text="Show live layout",command=self._draw_layout_preview).pack(side="left",padx=(16,0))
+        ttk.Button(nav,text="Open 3D viewer",command=self._open_3d_viewer).pack(side="left",padx=(4,0))
 
     # ------------------------------ behavior ------------------------------
     def _setup_traces(self):
@@ -531,6 +544,7 @@ Always run the full simulation after optimizing.
             self.heatsink_fin_heights_var
         ]:
             var.trace_add("write", lambda *a: (self._update_heatsink_label(), self._schedule_preview()))
+        self.resistor_side_var.trace_add("write", lambda *a: self._schedule_preview())
 
     def _schedule_preview(self):
         if not self._live_preview_ready: return
@@ -701,6 +715,10 @@ Always run the full simulation after optimizing.
                  "Positions: 'even' or comma-separated centers. Heights: 'same' or comma-separated values.",
             foreground="#555",wraplength=420,justify="left"
         ).grid(row=7,column=0,columnspan=2,sticky="w",pady=(8,0))
+        fin_btns=ttk.Frame(geom); fin_btns.grid(row=8,column=0,columnspan=2,sticky="ew",pady=(8,0))
+        ttk.Button(fin_btns,text="Fin layout designer...",command=self._open_fin_layout_designer).pack(side="left",padx=(0,4))
+        ttk.Button(fin_btns,text="Even fins",command=self._set_fins_even).pack(side="left",padx=(0,4))
+        ttk.Button(fin_btns,text="Place fins near resistors",command=self._set_fins_near_resistors).pack(side="left")
 
         simple=ttk.LabelFrame(f,text="Simple area fallback",padding=8)
         simple.grid(row=3,column=0,columnspan=2,sticky="ew",pady=(0,8)); simple.columnconfigure(1,weight=1)
@@ -1001,6 +1019,202 @@ Always run the full simulation after optimizing.
         if snap is None: return
         path=filedialog.asksaveasfilename(title="Export grid",initialfile=f"temperature_grid_{safe_time_name(snap.label)}.csv",defaultextension='.csv',filetypes=[('CSV','*.csv'),('All','*.*')])
         if path: save_temperature_grid_csv(self.result.x_m,self.result.y_m,snap.temp_c,Path(path)); self._append_status(f"Exported CSV: {path}")
+
+    # ----------------------------- 3D viewer / fin designer -----------------------------
+    def _current_3d_snapshot_data(self):
+        """Return cfg, x_cm, y_cm, temp array, label for the 3D viewer."""
+        if self.result is not None:
+            snap = self._current_snapshot() or self.result.snapshots[0]
+            return self.result.cfg, self.result.x_m * 100.0, self.result.y_m * 100.0, snap.temp_c, snap.label
+
+        cfg = self._read_config_loose_for_heatsink()
+        nx = max(8, min(60, int(round(cfg.plate_length_cm / max(0.5, cfg.grid_mm / 10.0)))))
+        ny = max(8, min(60, int(round(cfg.plate_width_cm / max(0.5, cfg.grid_mm / 10.0)))))
+        x = np.linspace(-cfg.plate_length_cm / 2.0, cfg.plate_length_cm / 2.0, nx)
+        y = np.linspace(-cfg.plate_width_cm / 2.0, cfg.plate_width_cm / 2.0, ny)
+        temp = np.full((nx, ny), cfg.ambient_c, dtype=float)
+        return cfg, x, y, temp, "live geometry"
+
+    def _temp_nearest_3d(self, x_cm, y_cm, xs_cm, ys_cm, temp):
+        ix = int(np.argmin(np.abs(xs_cm - x_cm)))
+        iy = int(np.argmin(np.abs(ys_cm - y_cm)))
+        return float(temp[ix, iy])
+
+    def _box_faces_3d(self, cx, cy, cz, sx, sy, sz):
+        x0, x1 = cx - sx / 2.0, cx + sx / 2.0
+        y0, y1 = cy - sy / 2.0, cy + sy / 2.0
+        z0, z1 = cz - sz / 2.0, cz + sz / 2.0
+        v = [(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)]
+        return [[v[0],v[1],v[2],v[3]],[v[4],v[5],v[6],v[7]],[v[0],v[1],v[5],v[4]],[v[1],v[2],v[6],v[5]],[v[2],v[3],v[7],v[6]],[v[3],v[0],v[4],v[7]]]
+
+    def _add_box_3d(self, ax, cx, cy, cz, sx, sy, sz, color, alpha=0.55, edge=True):
+        poly = Poly3DCollection(self._box_faces_3d(cx, cy, cz, sx, sy, sz), facecolors=color, edgecolors=("k" if edge else color), linewidths=0.35, alpha=alpha)
+        ax.add_collection3d(poly)
+
+    def _open_3d_viewer(self):
+        win = tk.Toplevel(self)
+        win.title("3D heatmap viewer")
+        win.geometry("1050x780")
+        win.transient(self)
+        controls = ttk.Frame(win, padding=8); controls.pack(side="top", fill="x")
+        show_fins = tk.BooleanVar(value=True); show_res = tk.BooleanVar(value=True); heat_both = tk.BooleanVar(value=False)
+        side_var = tk.StringVar(value=self.resistor_side_var.get()); view_var = tk.StringVar(value="Isometric")
+        snap_var = tk.IntVar(value=int(round(float(self.time_slider.get()))) if self.result is not None else 0)
+        ttk.Checkbutton(controls, text="Show fins", variable=show_fins).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Show resistors", variable=show_res).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Heatmap both faces", variable=heat_both).pack(side="left", padx=(0,8))
+        ttk.Label(controls, text="Resistors").pack(side="left")
+        ttk.Combobox(controls, textvariable=side_var, values=["Front / flat side","Back / fin side","Both sides"], state="readonly", width=16).pack(side="left", padx=(4,8))
+        ttk.Label(controls, text="View").pack(side="left")
+        ttk.Combobox(controls, textvariable=view_var, values=["Isometric","Front","Back","Side X","Side Y"], state="readonly", width=10).pack(side="left", padx=(4,8))
+        max_snap = len(self.result.snapshots)-1 if self.result is not None else 0
+        slider = ttk.Scale(controls, from_=0, to=max_snap, orient="horizontal", variable=snap_var); slider.pack(side="left", fill="x", expand=True, padx=(8,4))
+        label_var = tk.StringVar(value=""); ttk.Label(controls, textvariable=label_var, width=22).pack(side="left")
+        fig = Figure(figsize=(9,7), dpi=100); canvas = FigureCanvasTkAgg(fig, master=win); canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        tb = NavigationToolbar2Tk(canvas, win); tb.update()
+        def draw(*_):
+            try:
+                cfg, x_cm, y_cm, temp, label = self._current_3d_snapshot_data()
+                if self.result is not None:
+                    idx = max(0, min(len(self.result.snapshots)-1, int(round(float(snap_var.get())))))
+                    snap = self.result.snapshots[idx]; cfg = self.result.cfg; x_cm = self.result.x_m*100.0; y_cm = self.result.y_m*100.0; temp = snap.temp_c; label = snap.label
+                fig.clear(); ax3 = fig.add_subplot(111, projection="3d")
+                X,Y = np.meshgrid(x_cm, y_cm, indexing="ij")
+                t_cm = max(0.02, cfg.plate_thickness_mm/10.0)
+                norm = Normalize(vmin=float(np.min(temp)), vmax=float(np.max(temp)) if float(np.max(temp))>float(np.min(temp)) else float(np.min(temp))+1)
+                colors = cm.inferno(norm(temp))
+                ax3.plot_surface(X,Y,np.zeros_like(X),facecolors=colors,shade=False,linewidth=0,antialiased=False)
+                if heat_both.get(): ax3.plot_surface(X,Y,np.full_like(X,-t_cm),facecolors=colors,shade=False,linewidth=0,antialiased=False,alpha=0.85)
+                if show_fins.get():
+                    for fin in heatsink_fin_specs(cfg):
+                        fx,fy=fin["center_x_cm"],fin["center_y_cm"]; fw=max(0.02,fin["footprint_x_cm"]); fr=max(0.02,fin["footprint_y_cm"]); fh=max(0.02,fin["height_mm"]/10.0)
+                        tc=self._temp_nearest_3d(fx,fy,x_cm,y_cm,temp)
+                        self._add_box_3d(ax3,fx,fy,-t_cm-fh/2.0,fw,fr,fh,cm.inferno(norm(tc)),alpha=0.60)
+                if show_res.get():
+                    z_sides=[]; side=side_var.get()
+                    if side in ("Front / flat side","Both sides"): z_sides.append((0.28,1))
+                    if side in ("Back / fin side","Both sides"): z_sides.append((-t_cm-0.28,-1))
+                    for r in cfg.resistors:
+                        sx=max(0.03,r.length_mm/10.0); sy=max(0.03,r.width_mm/10.0); sz=0.55; tc=self._temp_nearest_3d(r.center_x_cm,r.center_y_cm,x_cm,y_cm,temp)
+                        for zc,sign in z_sides:
+                            self._add_box_3d(ax3,r.center_x_cm,r.center_y_cm,zc,sx,sy,sz,cm.inferno(norm(tc)),alpha=0.88)
+                            ax3.text(r.center_x_cm,r.center_y_cm,zc+sign*0.35,r.name,ha="center",va="center",fontsize=8)
+                mappable=cm.ScalarMappable(norm=norm,cmap=cm.inferno); mappable.set_array(temp); fig.colorbar(mappable,ax=ax3,shrink=0.70,pad=0.02,label="Temperature, °C")
+                maxx=max(abs(float(x_cm[0])),abs(float(x_cm[-1])),1.0); maxy=max(abs(float(y_cm[0])),abs(float(y_cm[-1])),1.0)
+                zmin=-t_cm-max([fin.get("height_mm",0)/10.0 for fin in heatsink_fin_specs(cfg)]+[1.0])-0.8; zmax=1.2
+                ax3.set_xlim(-maxx,maxx); ax3.set_ylim(-maxy,maxy); ax3.set_zlim(zmin,zmax)
+                ax3.set_xlabel("x / width cm"); ax3.set_ylabel("y / height cm"); ax3.set_zlabel("z cm"); ax3.set_title(f"3D heatmap: {label}")
+                try: ax3.set_box_aspect((2*maxx,2*maxy,max(1.0,zmax-zmin)))
+                except Exception: pass
+                view=view_var.get()
+                if view=="Front": ax3.view_init(elev=80,azim=-90)
+                elif view=="Back": ax3.view_init(elev=-75,azim=-90)
+                elif view=="Side X": ax3.view_init(elev=12,azim=0)
+                elif view=="Side Y": ax3.view_init(elev=12,azim=90)
+                else: ax3.view_init(elev=28,azim=-55)
+                label_var.set(label); fig.subplots_adjust(left=0.02,right=0.90,bottom=0.02,top=0.94); canvas.draw_idle()
+            except Exception as e:
+                label_var.set(f"3D error: {e}")
+        for var in (show_fins,show_res,heat_both,side_var,view_var): var.trace_add("write",lambda *a:draw())
+        slider.configure(command=lambda v:draw()); draw()
+
+    def _fin_count_int(self):
+        return max(0, int(round(parse_float(self.heatsink_fin_count_var.get(), "Fin count", 0))))
+
+    def _fin_across_bounds(self):
+        px=parse_float(self.plate_width_x_var.get(),"Plate width",0.1); py=parse_float(self.plate_height_y_var.get(),"Plate height",0.1)
+        t_mm=self._float_or_zero_for_full_same(self.heatsink_fin_thickness_var.get(),parse_float(self.plate_thickness_var.get(),"Plate thickness",0.1))
+        across=px if self._heatsink_orientation_key()=="run_y" else py; half=t_mm/20.0
+        return -across/2.0+half, across/2.0-half
+
+    def _parse_fin_list(self, raw, fallback, count):
+        raw=str(raw).strip().lower()
+        if raw in ("","same","even","full"): return [fallback]*count
+        vals=[parse_float(p.strip(),"Fin list value") for p in raw.replace(";",",").split(",") if p.strip()]
+        if not vals: return [fallback]*count
+        if len(vals)<count: vals += [vals[-1]]*(count-len(vals))
+        return vals[:count]
+
+    def _set_fins_even(self):
+        self.heatsink_enabled_var.set(True); self.heatsink_mode_var.set("Geometry builder"); self.heatsink_fin_positions_var.set("even"); self._update_heatsink_label(); self._schedule_preview()
+
+    def _set_fins_near_resistors(self):
+        try:
+            self.heatsink_enabled_var.set(True); self.heatsink_mode_var.set("Geometry builder")
+            count=self._fin_count_int();
+            if count<=0: raise ValueError("Fin count must be above 0.")
+            lo,hi=self._fin_across_bounds()
+            if count==1: positions=[0.0]
+            else:
+                even=list(np.linspace(lo,hi,count)); axis=[r.center_x_cm if self._heatsink_orientation_key()=="run_y" else r.center_y_cm for r in self.resistors]
+                axis=[min(hi,max(lo,v)) for v in axis]; positions=[]
+                for v in axis:
+                    if len(positions)<count: positions.append(v)
+                for v in even:
+                    if len(positions)<count: positions.append(float(v))
+                positions=sorted(positions[:count]); min_gap=max(0.05,(hi-lo)/max(1,count-1)*0.20)
+                for i in range(1,len(positions)):
+                    if positions[i]-positions[i-1]<min_gap: positions[i]=min(hi,positions[i-1]+min_gap)
+                for i in range(len(positions)-2,-1,-1):
+                    if positions[i+1]-positions[i]<min_gap: positions[i]=max(lo,positions[i+1]-min_gap)
+            self.heatsink_fin_positions_var.set(", ".join(f"{p:.2f}" for p in positions)); self._update_heatsink_label(); self._schedule_preview()
+        except Exception as e: messagebox.showerror("Fin layout",str(e))
+
+    def _set_fins_edge_biased(self):
+        try:
+            count=self._fin_count_int();
+            if count<=0: raise ValueError("Fin count must be above 0.")
+            lo,hi=self._fin_across_bounds(); positions=[0.0] if count==1 else [lo+(hi-lo)*(0.5-0.5*math.cos(math.pi*i/(count-1))) for i in range(count)]
+            self.heatsink_fin_positions_var.set(", ".join(f"{p:.2f}" for p in positions)); self._update_heatsink_label(); self._schedule_preview()
+        except Exception as e: messagebox.showerror("Fin layout",str(e))
+
+    def _open_fin_layout_designer(self):
+        try:
+            count=self._fin_count_int();
+            if count<=0: raise ValueError("Set number of fins first.")
+            lo,hi=self._fin_across_bounds(); default_h=parse_float(self.heatsink_fin_height_var.get(),"Default fin height",0.1)
+            positions=([0.0] if count==1 else list(np.linspace(lo,hi,count))) if str(self.heatsink_fin_positions_var.get()).strip().lower()=="even" else self._parse_fin_list(self.heatsink_fin_positions_var.get(),0.0,count)
+            heights=self._parse_fin_list(self.heatsink_fin_heights_var.get(),default_h,count)
+        except Exception as e:
+            messagebox.showerror("Fin layout",str(e)); return
+        win=tk.Toplevel(self); win.title("Fin layout designer"); win.geometry("560x520"); win.transient(self)
+        frame=ttk.Frame(win,padding=10); frame.pack(fill="both",expand=True)
+        tree=ttk.Treeview(frame,columns=("idx","pos","height"),show="headings",height=12)
+        for c,h,w in [("idx","Fin",50),("pos","Position cm",120),("height","Height mm",120)]: tree.heading(c,text=h); tree.column(c,width=w,anchor="center")
+        tree.grid(row=0,column=0,columnspan=4,sticky="nsew"); sb=ttk.Scrollbar(frame,orient="vertical",command=tree.yview); sb.grid(row=0,column=4,sticky="ns"); tree.configure(yscrollcommand=sb.set); frame.rowconfigure(0,weight=1); frame.columnconfigure(2,weight=1)
+        pos_var=tk.StringVar(); height_var=tk.StringVar(); ttk.Label(frame,text="Position cm").grid(row=1,column=0,sticky="w",pady=(8,2)); ttk.Entry(frame,textvariable=pos_var,width=12).grid(row=1,column=1,sticky="ew",pady=(8,2)); ttk.Label(frame,text="Height mm").grid(row=1,column=2,sticky="w",pady=(8,2)); ttk.Entry(frame,textvariable=height_var,width=12).grid(row=1,column=3,sticky="ew",pady=(8,2))
+        for i,(p,h) in enumerate(zip(positions,heights),1): tree.insert("","end",iid=str(i-1),values=(i,f"{p:.3f}",f"{h:.3f}"))
+        def selected():
+            sel=tree.selection(); return int(sel[0]) if sel else None
+        def on_select(event=None):
+            i=selected();
+            if i is None: return
+            vals=tree.item(str(i),"values"); pos_var.set(vals[1]); height_var.set(vals[2])
+        def update_selected():
+            i=selected();
+            if i is None: messagebox.showinfo("Fin layout","Select a fin first."); return
+            p=min(hi,max(lo,parse_float(pos_var.get(),"Position"))); h=parse_float(height_var.get(),"Height",0.1); tree.item(str(i),values=(i+1,f"{p:.3f}",f"{h:.3f}"))
+        def set_even():
+            vals=[0.0] if count==1 else list(np.linspace(lo,hi,count))
+            for i,item in enumerate(tree.get_children()): tree.item(item,values=(i+1,f"{vals[i]:.3f}",tree.item(item,"values")[2]))
+        def set_edge():
+            vals=[0.0] if count==1 else [lo+(hi-lo)*(0.5-0.5*math.cos(math.pi*i/(count-1))) for i in range(count)]
+            for i,item in enumerate(tree.get_children()): tree.item(item,values=(i+1,f"{vals[i]:.3f}",tree.item(item,"values")[2]))
+        def set_res():
+            self._set_fins_near_resistors(); vals=self._parse_fin_list(self.heatsink_fin_positions_var.get(),0.0,count)
+            for i,item in enumerate(tree.get_children()): tree.item(item,values=(i+1,f"{vals[i]:.3f}",tree.item(item,"values")[2]))
+        def apply_close(close=False):
+            pos=[]; hs=[]
+            for item in tree.get_children():
+                vals=tree.item(item,"values"); pos.append(min(hi,max(lo,float(vals[1])))); hs.append(max(0.1,float(vals[2])))
+            self.heatsink_enabled_var.set(True); self.heatsink_mode_var.set("Geometry builder"); self.heatsink_fin_positions_var.set(", ".join(f"{p:.3f}" for p in pos)); self.heatsink_fin_heights_var.set(", ".join(f"{h:.3f}" for h in hs)); self._update_heatsink_label(); self._schedule_preview()
+            if close: win.destroy()
+        tree.bind("<<TreeviewSelect>>",on_select)
+        if tree.get_children(): tree.selection_set("0"); on_select()
+        b=ttk.Frame(frame); b.grid(row=2,column=0,columnspan=4,sticky="ew",pady=(8,0)); ttk.Button(b,text="Update selected",command=update_selected).pack(side="left",padx=(0,4)); ttk.Button(b,text="Even",command=set_even).pack(side="left",padx=(0,4)); ttk.Button(b,text="Edge-biased",command=set_edge).pack(side="left",padx=(0,4)); ttk.Button(b,text="Near resistors",command=set_res).pack(side="left")
+        ttk.Label(frame,text=f"Allowed position range: {lo:.2f} to {hi:.2f} cm on the fin spread axis. Positions are centerlines.",foreground="#555",wraplength=500).grid(row=3,column=0,columnspan=4,sticky="w",pady=(10,0))
+        c=ttk.Frame(frame); c.grid(row=4,column=0,columnspan=4,sticky="ew",pady=(12,0)); ttk.Button(c,text="Apply",command=lambda:apply_close(False)).pack(side="left",padx=(0,4)); ttk.Button(c,text="Apply and close",command=lambda:apply_close(True)).pack(side="left",padx=(0,4)); ttk.Button(c,text="Close",command=win.destroy).pack(side="right")
+
 
     # ------------------------------- status -------------------------------
     def _set_status(self,text):

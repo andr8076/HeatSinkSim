@@ -1,4 +1,4 @@
-Thermal Plate Simulator v10
+Thermal Plate Simulator v11
 ===========================
 
 This package is intended to run on:
@@ -11,7 +11,7 @@ Main files
 ----------
 
 - run_thermal_sim.py              Cross-platform launcher
-- thermal_plate_sim_v10_gui.py    GUI
+- thermal_plate_sim_v11_gui.py    GUI
 - thermal_core.py                 Simulation engine
 - requirements.txt                Python dependencies
 
@@ -82,7 +82,7 @@ On Arch/EndeavourOS:
     sudo pacman -S tk
 
 
-v10 cross-platform changes
+v11 changes
 --------------------------
 
 - macOS Tk warning suppression.
@@ -96,6 +96,10 @@ v10 cross-platform changes
   - macOS: Command-S save, Command-O load, Command-R run, Esc cancel
   - Windows/Linux: Ctrl-S save, Ctrl-O load, Ctrl-R run, Esc cancel
 - Cross-platform launcher that checks Python, Tkinter, NumPy, and Matplotlib.
+- 3D heatmap viewer with base plate, fins, and resistor blocks.
+- 3D resistor side display: front, back/fin side, or both sides.
+- Fin layout designer for individual fin center positions and heights.
+- Fin presets: even, edge-biased, and place fins near resistor heat sources.
 
 
 Notes
