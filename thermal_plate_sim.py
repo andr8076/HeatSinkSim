@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v4_gui.py
+thermal_plate_sim_v5_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
-Adds an advanced cooling estimator for passive builds.
+Adds live layout preview, advanced cooling, even-spread banks, and a basic location optimizer.
 
 Features:
   - Tkinter UI
@@ -13,6 +13,10 @@ Features:
   - Slider through time snapshots
   - Optional steady-state final heatmap
   - Advanced cooling estimator for orientation, enclosure, wall clearance, surface, air movement, hot-air path, and blockage
+  - Live plate/resistor layout preview before running
+  - Even-spread resistor bank generator
+  - Basic optimizer for resistor locations
+  - Field help window
   - Config save/load as JSON
   - Export current heatmap PNG
   - Export current temperature grid CSV
@@ -36,12 +40,13 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v4_gui.py
+  python3 thermal_plate_sim_v5_gui.py
 """
 
 from __future__ import annotations
 
 import csv
+import itertools
 import json
 import math
 import queue
@@ -704,11 +709,189 @@ def save_temperature_grid_csv(x_m: np.ndarray, y_m: np.ndarray, temp_c: np.ndarr
                 writer.writerow([f"{xv:.6f}", f"{yv:.6f}", f"{temp_c[ix, iy]:.6f}"])
 
 
+
+
+FIELD_HELP_TEXT = """Field meanings
+
+Plate width/X cm:
+  Horizontal size of the metal plate shown on screen. Bigger width gives more cooling area and more spacing room.
+
+Plate height/Y cm:
+  Vertical size of the metal plate shown on screen. Bigger height gives more cooling area and more spacing room.
+
+Thickness mm:
+  Metal thickness. More thickness improves heat spreading and thermal mass. It does not replace exposed surface area for continuous cooling.
+
+Material:
+  Template material. Template values lock k, density, and heat capacity. Choose custom if you want to edit them.
+
+k W/mK:
+  Thermal conductivity. Higher k spreads heat better across the plate. Aluminium is about 205, copper about 385, steel about 45.
+
+Density kg/m³:
+  Used for mass and warm-up behavior. Higher density usually means more thermal mass for the same volume.
+
+Heat cap J/kgK:
+  Specific heat capacity. Higher means the plate warms up more slowly.
+
+Ambient °C:
+  Air temperature around the plate. All predicted temperatures rise directly with this.
+
+h W/m²K:
+  Effective passive cooling strength to air. Lower h is worse cooling. For passive builds, h=5 is pessimistic, h=7 normal-ish, h=10 optimistic/good open air.
+
+Grid mm:
+  Simulation cell size. Smaller is more detailed but slower. 5 mm is a good start. 2.5 mm is detailed. 10 mm is rough but fast.
+
+Initial °C:
+  Starting plate temperature for the time-based warm-up simulation.
+
+Max time:
+  How long the transient simulation runs, e.g. 30m or 1h.
+
+Snapshot every:
+  Time distance between saved slider steps, e.g. 30s, 1m, 5m.
+
+Resistor power W:
+  Heat produced by that resistor. For safety testing, use worst-case power.
+
+Resistor x/y cm:
+  Center position of the resistor. x is horizontal, y is vertical. The plate center is 0,0.
+
+Resistor length/width mm:
+  Contact footprint touching the plate. This is the heat injection area, not necessarily the whole resistor body.
+
+Advanced cooling:
+  Turns real-world placement into an effective h estimate. It is still an estimate; real temperature testing is required.
+
+Optimize locations:
+  Tries several evenly-spaced candidate layouts and picks the one with the lowest simulated steady-state maximum temperature. It is a practical search, not a perfect mathematical proof.
+"""
+
+
+class ToolTip:
+    def __init__(self, widget, text: str, delay_ms: int = 450):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            self._tip = tk.Toplevel(self.widget)
+            self._tip.wm_overrideredirect(True)
+            self._tip.wm_geometry(f"+{x}+{y}")
+            label = ttk.Label(self._tip, text=self.text, justify="left", relief="solid", borderwidth=1, padding=6, wraplength=360)
+            label.pack()
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+def evenly_spaced_positions(count: int, plate_x_cm: float, plate_y_cm: float, footprint_l_mm: float, footprint_w_mm: float, margin_cm: float = 1.0) -> List[Tuple[float, float]]:
+    """Return a good-looking even grid of center positions inside the plate."""
+    if count <= 0:
+        return []
+    half_l_cm = footprint_l_mm / 20.0
+    half_w_cm = footprint_w_mm / 20.0
+    xmin = -plate_x_cm / 2.0 + half_l_cm + margin_cm
+    xmax =  plate_x_cm / 2.0 - half_l_cm - margin_cm
+    ymin = -plate_y_cm / 2.0 + half_w_cm + margin_cm
+    ymax =  plate_y_cm / 2.0 - half_w_cm - margin_cm
+    if xmin > xmax or ymin > ymax:
+        raise ValueError("The resistor footprint plus margin does not fit on the plate.")
+    best_positions = None
+    best_score = -1e99
+    for cols in range(1, count + 1):
+        rows = int(math.ceil(count / cols))
+        cells = rows * cols
+        xs = [0.0] if cols == 1 else list(np.linspace(xmin, xmax, cols))
+        ys = [0.0] if rows == 1 else list(np.linspace(ymin, ymax, rows))
+        grid = [(x, y) for y in ys for x in xs]
+        if cells > count and cells <= 16:
+            combos = itertools.combinations(grid, count)
+        else:
+            combos = [tuple(grid[:count])]
+        for combo in combos:
+            combo = list(combo)
+            if len(combo) < count:
+                continue
+            if count == 1:
+                min_pair = min(plate_x_cm, plate_y_cm)
+            else:
+                min_pair = min(math.hypot(combo[i][0] - combo[j][0], combo[i][1] - combo[j][1]) for i in range(count) for j in range(i + 1, count))
+            center_penalty = sum(math.hypot(x, y) for x, y in combo) / max(count, 1)
+            aspect_penalty = abs(cols - rows) * 0.05
+            score = min_pair - 0.05 * center_penalty - aspect_penalty
+            if score > best_score:
+                best_score = score
+                best_positions = combo
+    if best_positions is None:
+        raise ValueError("Could not create an even layout.")
+    return list(best_positions[:count])
+
+
+def candidate_layouts_for_count(count: int, plate_x_cm: float, plate_y_cm: float, footprint_l_mm: float, footprint_w_mm: float, margin_cm: float) -> List[List[Tuple[float, float]]]:
+    """Generate several sensible candidate layouts for optimization."""
+    layouts = []
+    seen = set()
+    def add(pos):
+        key = tuple((round(x, 3), round(y, 3)) for x, y in pos)
+        if key not in seen:
+            seen.add(key)
+            layouts.append(pos)
+    for m in [margin_cm, max(0.0, margin_cm / 2.0), margin_cm + 1.0, margin_cm + 2.0, 0.0]:
+        try:
+            add(evenly_spaced_positions(count, plate_x_cm, plate_y_cm, footprint_l_mm, footprint_w_mm, m))
+        except Exception:
+            pass
+    half_l_cm = footprint_l_mm / 20.0
+    half_w_cm = footprint_w_mm / 20.0
+    xmin = -plate_x_cm / 2.0 + half_l_cm + margin_cm
+    xmax =  plate_x_cm / 2.0 - half_l_cm - margin_cm
+    ymin = -plate_y_cm / 2.0 + half_w_cm + margin_cm
+    ymax =  plate_y_cm / 2.0 - half_w_cm - margin_cm
+    if xmin <= xmax:
+        xs = [0.0] if count == 1 else list(np.linspace(xmin, xmax, count))
+        add([(x, 0.0) for x in xs])
+    if ymin <= ymax:
+        ys = [0.0] if count == 1 else list(np.linspace(ymin, ymax, count))
+        add([(0.0, y) for y in ys])
+    return layouts
+
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v4.1")
+        self.title("Thermal Plate Simulator v5")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
@@ -726,6 +909,10 @@ class ThermalPlateGUI(tk.Tk):
         self._ignore_slider_callback = False
         self._drawing_snapshot = False
         self._current_snapshot_idx: Optional[int] = None
+        self._preview_after_id = None
+        self._updating_resistor_fields = False
+        self._live_preview_ready = False
+        self._optimization_running = False
 
         self.vmin: Optional[float] = None
         self.vmax: Optional[float] = None
@@ -733,6 +920,10 @@ class ThermalPlateGUI(tk.Tk):
         self._build_ui()
         self._refresh_resistor_tree()
         self._update_estimated_h()
+        self._update_material_field_states()
+        self._setup_live_traces()
+        self._live_preview_ready = True
+        self._draw_layout_preview()
         self.after(100, self._poll_queue)
 
     def _build_ui(self):
@@ -767,8 +958,8 @@ class ThermalPlateGUI(tk.Tk):
         self.rho_var = tk.StringVar(value="2700")
         self.cp_var = tk.StringVar(value="900")
 
-        self._entry_row(plate_frame, 0, "Length cm", self.plate_length_var)
-        self._entry_row(plate_frame, 1, "Width cm", self.plate_width_var)
+        self._entry_row(plate_frame, 0, "Plate width/X cm", self.plate_length_var)
+        self._entry_row(plate_frame, 1, "Plate height/Y cm", self.plate_width_var)
         self._entry_row(plate_frame, 2, "Thickness mm", self.plate_thickness_var)
 
         ttk.Label(plate_frame, text="Material").grid(row=3, column=0, sticky="w", pady=2)
@@ -782,9 +973,9 @@ class ThermalPlateGUI(tk.Tk):
         mat.grid(row=3, column=1, sticky="ew", pady=2)
         mat.bind("<<ComboboxSelected>>", self._material_changed)
 
-        self._entry_row(plate_frame, 4, "k W/mK", self.k_var)
-        self._entry_row(plate_frame, 5, "Density kg/m³", self.rho_var)
-        self._entry_row(plate_frame, 6, "Heat cap J/kgK", self.cp_var)
+        self.k_entry = self._entry_row(plate_frame, 4, "k W/mK", self.k_var)
+        self.rho_entry = self._entry_row(plate_frame, 5, "Density kg/m³", self.rho_var)
+        self.cp_entry = self._entry_row(plate_frame, 6, "Heat cap J/kgK", self.cp_var)
 
         cooling_frame = ttk.LabelFrame(parent, text="Cooling / time", padding=8)
         cooling_frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
@@ -917,7 +1108,20 @@ class ThermalPlateGUI(tk.Tk):
         ttk.Button(btn_frame, text="Add", command=self._add_resistor).pack(side="left", padx=(0, 4))
         ttk.Button(btn_frame, text="Update", command=self._update_resistor).pack(side="left", padx=(0, 4))
         ttk.Button(btn_frame, text="Delete", command=self._delete_resistor).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_frame, text="Spread 4", command=self._spread_four_example).pack(side="left")
+
+        bank_frame = ttk.LabelFrame(resistor_frame, text="Even-spread bank", padding=6)
+        bank_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.bank_count_var = tk.StringVar(value="4")
+        self.bank_power_var = tk.StringVar(value="50")
+        self.bank_len_var = tk.StringVar(value="50")
+        self.bank_wid_var = tk.StringVar(value="20")
+        self.bank_margin_var = tk.StringVar(value="1")
+        bank_fields = [("Count", self.bank_count_var), ("W each", self.bank_power_var), ("Len mm", self.bank_len_var), ("Wid mm", self.bank_wid_var), ("Margin cm", self.bank_margin_var)]
+        for bi, (blabel, bvar) in enumerate(bank_fields):
+            ttk.Label(bank_frame, text=blabel).grid(row=bi // 2, column=(bi % 2) * 2, sticky="w", pady=2)
+            ttk.Entry(bank_frame, textvariable=bvar, width=8).grid(row=bi // 2, column=(bi % 2) * 2 + 1, sticky="ew", pady=2)
+        ttk.Button(bank_frame, text="Create even bank", command=self._create_even_bank).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(bank_frame, text="Optimize locations", command=self._start_optimize_locations).grid(row=3, column=2, columnspan=2, sticky="ew", pady=(6, 0), padx=(4, 0))
 
         run_frame = ttk.LabelFrame(parent, text="Run", padding=8)
         run_frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
@@ -941,6 +1145,7 @@ class ThermalPlateGUI(tk.Tk):
             variable=self.fixed_scale_var,
             command=self._redraw_current_snapshot,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(run_frame, text="Field help / value meanings", command=self._show_help_window).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         status_frame = ttk.LabelFrame(parent, text="Status / summary", padding=8)
         status_frame.grid(row=row, column=0, sticky="nsew")
@@ -964,9 +1169,9 @@ class ThermalPlateGUI(tk.Tk):
 
         self.fig = Figure(figsize=(8, 6), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("No simulation yet")
-        self.ax.set_xlabel("x cm")
-        self.ax.set_ylabel("y cm")
+        self.ax.set_title("Layout preview")
+        self.ax.set_xlabel("x position / plate width, cm")
+        self.ax.set_ylabel("y position / plate height, cm")
         self.colorbar = None
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
@@ -1017,11 +1222,23 @@ class ThermalPlateGUI(tk.Tk):
 
     def _material_changed(self, event=None):
         name = self.material_var.get()
-        if name in MATERIALS:
+        if name in MATERIALS and name != "custom":
             m = MATERIALS[name]
             self.k_var.set(str(m["k"]))
             self.rho_var.set(str(m["rho"]))
             self.cp_var.set(str(m["cp"]))
+        self._update_material_field_states()
+        self._schedule_preview_update()
+
+    def _update_material_field_states(self):
+        if not all(hasattr(self, attr) for attr in ("k_entry", "rho_entry", "cp_entry")):
+            return
+        state = "normal" if self.material_var.get() == "custom" else "disabled"
+        for entry in (self.k_entry, self.rho_entry, self.cp_entry):
+            try:
+                entry.configure(state=state)
+            except Exception:
+                pass
 
     def _refresh_resistor_tree(self):
         for item in self.res_tree.get_children():
@@ -1049,12 +1266,16 @@ class ThermalPlateGUI(tk.Tk):
         idx = int(sel[0])
         if 0 <= idx < len(self.resistors):
             r = self.resistors[idx]
-            self.r_name_var.set(r.name)
-            self.r_power_var.set(f"{r.power_w:g}")
-            self.r_x_var.set(f"{r.center_x_cm:g}")
-            self.r_y_var.set(f"{r.center_y_cm:g}")
-            self.r_len_var.set(f"{r.length_mm:g}")
-            self.r_wid_var.set(f"{r.width_mm:g}")
+            self._updating_resistor_fields = True
+            try:
+                self.r_name_var.set(r.name)
+                self.r_power_var.set(f"{r.power_w:g}")
+                self.r_x_var.set(f"{r.center_x_cm:g}")
+                self.r_y_var.set(f"{r.center_y_cm:g}")
+                self.r_len_var.set(f"{r.length_mm:g}")
+                self.r_wid_var.set(f"{r.width_mm:g}")
+            finally:
+                self._updating_resistor_fields = False
 
     def _read_resistor_fields(self) -> Resistor:
         name = self.r_name_var.get().strip() or f"R{len(self.resistors)+1}"
@@ -1069,6 +1290,7 @@ class ThermalPlateGUI(tk.Tk):
         try:
             self.resistors.append(self._read_resistor_fields())
             self._refresh_resistor_tree()
+            self._schedule_preview_update()
         except Exception as e:
             messagebox.showerror("Invalid resistor", str(e))
 
@@ -1082,6 +1304,7 @@ class ThermalPlateGUI(tk.Tk):
             self.resistors[idx] = self._read_resistor_fields()
             self._refresh_resistor_tree()
             self.res_tree.selection_set(str(idx))
+            self._schedule_preview_update()
         except Exception as e:
             messagebox.showerror("Invalid resistor", str(e))
 
@@ -1093,6 +1316,7 @@ class ThermalPlateGUI(tk.Tk):
         if 0 <= idx < len(self.resistors):
             del self.resistors[idx]
             self._refresh_resistor_tree()
+            self._schedule_preview_update()
 
     def _spread_four_example(self):
         self.resistors = [
@@ -1102,7 +1326,109 @@ class ThermalPlateGUI(tk.Tk):
             Resistor("R4", 50.0,  5.0,  5.0, 50.0, 20.0),
         ]
         self._refresh_resistor_tree()
+        self._schedule_preview_update()
         self._set_status("Loaded example with four 50 W resistors spread around the center.")
+
+    def _create_even_bank(self):
+        try:
+            count = int(parse_float(self.bank_count_var.get(), "Bank count", 1))
+            if count < 1:
+                raise ValueError("Bank count must be at least 1.")
+            power_each = parse_float(self.bank_power_var.get(), "Bank power each", 0.0)
+            length_mm = parse_float(self.bank_len_var.get(), "Bank resistor length", 0.1)
+            width_mm = parse_float(self.bank_wid_var.get(), "Bank resistor width", 0.1)
+            margin_cm = parse_float(self.bank_margin_var.get(), "Bank margin", 0.0)
+            plate_x = parse_float(self.plate_length_var.get(), "Plate width/X", 0.1)
+            plate_y = parse_float(self.plate_width_var.get(), "Plate height/Y", 0.1)
+            positions = evenly_spaced_positions(count, plate_x, plate_y, length_mm, width_mm, margin_cm)
+            self.resistors = [Resistor(f"R{i + 1}", power_each, x, y, length_mm, width_mm) for i, (x, y) in enumerate(positions)]
+            self._refresh_resistor_tree()
+            self._schedule_preview_update()
+            self._set_status(f"Created {count} evenly-spread resistors. Run simulation to calculate temperatures.")
+        except Exception as e:
+            messagebox.showerror("Even-spread bank failed", str(e))
+
+    def _start_optimize_locations(self):
+        if self._optimization_running:
+            messagebox.showinfo("Optimizer", "Optimization is already running.")
+            return
+        try:
+            cfg = self._read_config()
+        except Exception as e:
+            messagebox.showerror("Invalid input", str(e))
+            return
+        if len(cfg.resistors) < 2:
+            messagebox.showinfo("Optimizer", "Add at least two resistors to optimize spacing.")
+            return
+        self._optimization_running = True
+        self._set_status("Optimizer running. It will try several even layouts and pick the lowest steady-state max temperature.")
+        def worker():
+            try:
+                best_positions, best_temp, tried = self._optimize_locations_worker(cfg)
+                self.msg_queue.put(("opt_done", (best_positions, best_temp, tried)))
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.msg_queue.put(("opt_error", f"{e}\n\n{tb}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _optimize_locations_worker(self, cfg: PlateConfig):
+        count = len(cfg.resistors)
+        max_l = max(r.length_mm for r in cfg.resistors)
+        max_w = max(r.width_mm for r in cfg.resistors)
+        try:
+            margin_cm = parse_float(self.bank_margin_var.get(), "Bank margin", 0.0)
+        except Exception:
+            margin_cm = 1.0
+        layouts = candidate_layouts_for_count(count, cfg.plate_length_cm, cfg.plate_width_cm, max_l, max_w, margin_cm)
+        if not layouts:
+            raise ValueError("No candidate layouts fit on the plate.")
+        opt_cfg = PlateConfig(**asdict(cfg))
+        opt_cfg.grid_mm = max(cfg.grid_mm, 8.0)
+        opt_cfg.max_time_s = 60.0
+        opt_cfg.snapshot_every_s = 60.0
+        opt_cfg.include_steady_state = True
+        best_positions = None
+        best_temp = float("inf")
+        tried = 0
+        orders = [list(range(count))]
+        by_power = sorted(range(count), key=lambda i: cfg.resistors[i].power_w, reverse=True)
+        if by_power != orders[0]:
+            orders.append(by_power)
+        for layout in layouts:
+            for order in orders:
+                tried += 1
+                test_res = [Resistor(**asdict(r)) for r in cfg.resistors]
+                sorted_positions = sorted(layout, key=lambda p: math.hypot(p[0], p[1]))
+                assigned = [None] * count
+                for pos_i, res_i in enumerate(order):
+                    assigned[res_i] = sorted_positions[pos_i]
+                for i, pos in enumerate(assigned):
+                    test_res[i].center_x_cm = pos[0]
+                    test_res[i].center_y_cm = pos[1]
+                opt_cfg.resistors = test_res
+                x, y, dx, dy = build_grid(opt_cfg)
+                q, _masks = add_heat_sources(opt_cfg, x, y, dx, dy)
+                temp, _info = solve_steady_state(opt_cfg, q, dx, dy, progress_callback=None, stop_event=self.stop_event, max_iter=9000, tolerance_c=0.01)
+                max_temp = float(np.max(temp))
+                if max_temp < best_temp:
+                    best_temp = max_temp
+                    best_positions = assigned
+                self.msg_queue.put(("progress", f"Optimizer tried {tried} layouts. Best max so far: {best_temp:.1f} °C"))
+        if best_positions is None:
+            raise ValueError("Optimizer did not find a valid layout.")
+        return best_positions, best_temp, tried
+
+    def _apply_optimized_positions(self, positions: List[Tuple[float, float]], best_temp: float, tried: int):
+        for r, (x, y) in zip(self.resistors, positions):
+            r.center_x_cm = x
+            r.center_y_cm = y
+        self._refresh_resistor_tree()
+        self._schedule_preview_update()
+        self._set_status(
+            f"Optimizer finished. Tried {tried} candidate layouts.\n"
+            f"Best coarse steady-state max estimate: {best_temp:.1f} °C.\n\n"
+            "Positions have been applied. Run the full simulation for the final detailed result."
+        )
 
     def _estimate_h_from_ui(self) -> Tuple[float, str]:
         orientation = key_from_display(ORIENTATION_OPTIONS, self.orientation_var.get())
@@ -1242,6 +1568,14 @@ class ThermalPlateGUI(tk.Tk):
                     self.cancel_button.configure(state="disabled")
                     self._append_status("Error:\n" + str(payload))
                     messagebox.showerror("Simulation error", str(payload).split("\n\n")[0])
+                elif msg_type == "opt_done":
+                    self._optimization_running = False
+                    positions, best_temp, tried = payload
+                    self._apply_optimized_positions(positions, best_temp, tried)
+                elif msg_type == "opt_error":
+                    self._optimization_running = False
+                    self._append_status("Optimizer error:\n" + str(payload))
+                    messagebox.showerror("Optimizer error", str(payload).split("\n\n")[0])
         except queue.Empty:
             pass
 
@@ -1381,7 +1715,12 @@ class ThermalPlateGUI(tk.Tk):
             self.ax = self.fig.add_subplot(111)
             self.colorbar = None
 
-            extent = [x_cm[0], x_cm[-1], y_cm[0], y_cm[-1]]
+            extent = [
+                -cfg.plate_length_cm / 2.0,
+                 cfg.plate_length_cm / 2.0,
+                -cfg.plate_width_cm / 2.0,
+                 cfg.plate_width_cm / 2.0,
+            ]
 
             if self.fixed_scale_var.get() and self.vmin is not None and self.vmax is not None:
                 vmin = self.vmin
@@ -1428,8 +1767,8 @@ class ThermalPlateGUI(tk.Tk):
             self.ax.text(max_x, max_y, f" max {max_t:.1f}°C", va="bottom")
 
             self.ax.set_title(f"{snap.label} | avg {avg_t:.1f}°C | max {max_t:.1f}°C")
-            self.ax.set_xlabel("x position, cm")
-            self.ax.set_ylabel("y position, cm")
+            self.ax.set_xlabel("x position / plate width, cm")
+            self.ax.set_ylabel("y position / plate height, cm")
             self.ax.grid(True, alpha=0.25)
 
             # Avoid tight_layout here. On some Windows/Matplotlib combinations
@@ -1441,6 +1780,109 @@ class ThermalPlateGUI(tk.Tk):
             self._current_snapshot_idx = idx
         finally:
             self._drawing_snapshot = False
+
+    def _setup_live_traces(self):
+        vars_to_watch = [
+            self.plate_length_var, self.plate_width_var, self.plate_thickness_var,
+            self.ambient_var, self.h_var, self.grid_var, self.initial_temp_var,
+            self.max_time_var, self.snapshot_every_var, self.material_var,
+            self.k_var, self.rho_var, self.cp_var,
+            self.advanced_cooling_var, self.orientation_var, self.environment_var,
+            self.clearance_var, self.surface_var, self.air_movement_var,
+            self.hot_air_path_var, self.blockage_var,
+        ]
+        for var in vars_to_watch:
+            try:
+                var.trace_add("write", lambda *args: self._schedule_preview_update())
+            except Exception:
+                pass
+        for var in [self.r_name_var, self.r_power_var, self.r_x_var, self.r_y_var, self.r_len_var, self.r_wid_var]:
+            try:
+                var.trace_add("write", lambda *args: self._live_resistor_edit_changed())
+            except Exception:
+                pass
+
+    def _live_resistor_edit_changed(self):
+        if self._updating_resistor_fields:
+            return
+        sel = self.res_tree.selection() if hasattr(self, "res_tree") else []
+        if sel:
+            try:
+                idx = int(sel[0])
+                if 0 <= idx < len(self.resistors):
+                    self.resistors[idx] = self._read_resistor_fields()
+                    self._refresh_resistor_tree()
+                    self.res_tree.selection_set(str(idx))
+            except Exception:
+                pass
+        self._schedule_preview_update()
+
+    def _schedule_preview_update(self):
+        if not getattr(self, "_live_preview_ready", False):
+            return
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            return
+        if self._preview_after_id is not None:
+            try:
+                self.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+        self._preview_after_id = self.after(180, self._draw_layout_preview)
+
+    def _draw_layout_preview(self):
+        self._preview_after_id = None
+        if self._drawing_snapshot:
+            return
+        try:
+            plate_x = parse_float(self.plate_length_var.get(), "Plate width/X", 0.1)
+            plate_y = parse_float(self.plate_width_var.get(), "Plate height/Y", 0.1)
+        except Exception:
+            return
+        self.result = None
+        self._current_snapshot_idx = None
+        self._ignore_slider_callback = True
+        try:
+            self.time_slider.configure(from_=0, to=0)
+            self.time_slider.set(0)
+        except Exception:
+            pass
+        finally:
+            self._ignore_slider_callback = False
+        self.snapshot_label_var.set("Layout preview")
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
+        self.colorbar = None
+        plate_rect = Rectangle((-plate_x / 2.0, -plate_y / 2.0), plate_x, plate_y, fill=False, linewidth=2)
+        self.ax.add_patch(plate_rect)
+        for r in self.resistors:
+            l_cm = r.length_mm / 10.0
+            w_cm = r.width_mm / 10.0
+            x0 = r.center_x_cm - l_cm / 2.0
+            y0 = r.center_y_cm - w_cm / 2.0
+            in_bounds = (x0 >= -plate_x / 2.0 and x0 + l_cm <= plate_x / 2.0 and y0 >= -plate_y / 2.0 and y0 + w_cm <= plate_y / 2.0)
+            rect = Rectangle((x0, y0), l_cm, w_cm, fill=True, alpha=0.25 if in_bounds else 0.55, linewidth=2)
+            self.ax.add_patch(rect)
+            self.ax.text(r.center_x_cm, r.center_y_cm, r.name, ha="center", va="center", fontsize=9)
+        pad = max(1.0, 0.08 * max(plate_x, plate_y))
+        self.ax.set_xlim(-plate_x / 2.0 - pad, plate_x / 2.0 + pad)
+        self.ax.set_ylim(-plate_y / 2.0 - pad, plate_y / 2.0 + pad)
+        self.ax.set_aspect("equal", adjustable="box")
+        self.ax.set_title("Layout preview — run simulation for heat map")
+        self.ax.set_xlabel("x position / plate width, cm")
+        self.ax.set_ylabel("y position / plate height, cm")
+        self.ax.grid(True, alpha=0.25)
+        self.fig.subplots_adjust(left=0.08, right=0.96, bottom=0.10, top=0.92)
+        self.canvas.draw_idle()
+
+    def _show_help_window(self):
+        win = tk.Toplevel(self)
+        win.title("Thermal simulator field help")
+        win.geometry("720x620")
+        txt = tk.Text(win, wrap="word", padx=10, pady=10)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", FIELD_HELP_TEXT)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=8)
 
     def _set_status(self, text: str):
         self.status_text.configure(state="normal")
@@ -1527,6 +1969,8 @@ class ThermalPlateGUI(tk.Tk):
         self._update_estimated_h()
         self.resistors = list(cfg.resistors)
         self._refresh_resistor_tree()
+        self._update_material_field_states()
+        self._schedule_preview_update()
 
     def _get_current_snapshot(self) -> Optional[SimulationSnapshot]:
         if self.result is None:
