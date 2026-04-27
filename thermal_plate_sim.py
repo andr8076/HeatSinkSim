@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v5_1_gui.py
+thermal_plate_sim_v5_2_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
-Adds live layout preview, advanced cooling, even-spread banks, and a basic location optimizer.
+Adds live layout preview, advanced cooling, even-spread banks, and a improved location optimizer.
 
 Features:
   - Tkinter UI
@@ -15,7 +15,7 @@ Features:
   - Advanced cooling estimator for orientation, enclosure, wall clearance, surface, air movement, hot-air path, and blockage
   - Live plate/resistor layout preview before running
   - Even-spread resistor bank generator
-  - Basic optimizer for resistor locations
+  - Improved thermal-interaction optimizer for resistor locations
   - Field help window
   - Config save/load as JSON
   - Export current heatmap PNG
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v5_1_gui.py
+  python3 thermal_plate_sim_v5_2_gui.py
 """
 
 from __future__ import annotations
@@ -816,82 +816,564 @@ class ToolTip:
             self._tip = None
 
 
-def evenly_spaced_positions(count: int, plate_x_cm: float, plate_y_cm: float, footprint_l_mm: float, footprint_w_mm: float, margin_cm: float = 1.0) -> List[Tuple[float, float]]:
-    """Return a good-looking even grid of center positions inside the plate."""
-    if count <= 0:
-        return []
-    half_l_cm = footprint_l_mm / 20.0
-    half_w_cm = footprint_w_mm / 20.0
+def _center_bounds_for_resistor(
+    r: Resistor,
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+) -> Tuple[float, float, float, float]:
+    """Allowed center coordinate range for one resistor."""
+    half_l_cm = r.length_mm / 20.0
+    half_w_cm = r.width_mm / 20.0
+
     xmin = -plate_x_cm / 2.0 + half_l_cm + margin_cm
     xmax =  plate_x_cm / 2.0 - half_l_cm - margin_cm
     ymin = -plate_y_cm / 2.0 + half_w_cm + margin_cm
     ymax =  plate_y_cm / 2.0 - half_w_cm - margin_cm
+
     if xmin > xmax or ymin > ymax:
-        raise ValueError("The resistor footprint plus margin does not fit on the plate.")
-    best_positions = None
-    best_score = -1e99
-    for cols in range(1, count + 1):
-        rows = int(math.ceil(count / cols))
-        cells = rows * cols
-        xs = [0.0] if cols == 1 else list(np.linspace(xmin, xmax, cols))
-        ys = [0.0] if rows == 1 else list(np.linspace(ymin, ymax, rows))
-        grid = [(x, y) for y in ys for x in xs]
-        if cells > count and cells <= 16:
-            combos = itertools.combinations(grid, count)
-        else:
-            combos = [tuple(grid[:count])]
-        for combo in combos:
-            combo = list(combo)
-            if len(combo) < count:
+        raise ValueError(
+            f"{r.name} does not fit on the plate with the current margin. "
+            "Reduce margin, reduce resistor size, or use a larger plate."
+        )
+
+    return xmin, xmax, ymin, ymax
+
+
+def _rectangles_overlap(
+    r1: Resistor,
+    p1: Tuple[float, float],
+    r2: Resistor,
+    p2: Tuple[float, float],
+    clearance_cm: float = 0.15,
+) -> bool:
+    """Axis-aligned footprint overlap check."""
+    x1, y1 = p1
+    x2, y2 = p2
+    half_l_1 = r1.length_mm / 20.0
+    half_w_1 = r1.width_mm / 20.0
+    half_l_2 = r2.length_mm / 20.0
+    half_w_2 = r2.width_mm / 20.0
+
+    return (
+        abs(x1 - x2) < (half_l_1 + half_l_2 + clearance_cm)
+        and abs(y1 - y2) < (half_w_1 + half_w_2 + clearance_cm)
+    )
+
+
+def _layout_is_valid(
+    resistors: List[Resistor],
+    positions: List[Tuple[float, float]],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+    clearance_cm: float = 0.15,
+) -> bool:
+    if len(resistors) != len(positions):
+        return False
+
+    for r, (x, y) in zip(resistors, positions):
+        xmin, xmax, ymin, ymax = _center_bounds_for_resistor(r, plate_x_cm, plate_y_cm, margin_cm)
+        if x < xmin or x > xmax or y < ymin or y > ymax:
+            return False
+
+    for i in range(len(resistors)):
+        for j in range(i + 1, len(resistors)):
+            if _rectangles_overlap(resistors[i], positions[i], resistors[j], positions[j], clearance_cm):
+                return False
+
+    return True
+
+
+def _thermal_interaction_objective(
+    resistors: List[Resistor],
+    positions: List[Tuple[float, float]],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    k_w_mk: float,
+    thickness_mm: float,
+    h_w_m2k: float,
+    margin_cm: float,
+) -> float:
+    """
+    Fast approximate layout score.
+
+    Lower is better.
+
+    This is not the full finite-difference solver. It is a fast optimizer score
+    designed to find sensible source placement before the real simulation.
+
+    It considers:
+      - heat sources heating each other
+      - edge/boundary penalty from reduced spreading room
+      - layout coverage across both X and Y
+      - power weighting
+    """
+    if not _layout_is_valid(resistors, positions, plate_x_cm, plate_y_cm, margin_cm):
+        return float("inf")
+
+    total_power = max(1e-9, sum(max(0.0, r.power_w) for r in resistors))
+
+    # Thin plate with convection has a useful thermal spreading length:
+    # L = sqrt(k*t/(2h)).
+    # In plain words: how far heat tends to spread before air cooling dominates.
+    t_m = max(0.0001, thickness_mm / 1000.0)
+    h = max(0.05, h_w_m2k)
+    spread_len_cm = math.sqrt(max(1e-12, k_w_mk * t_m / (2.0 * h))) * 100.0
+    spread_len_cm = max(2.0, min(spread_len_cm, max(plate_x_cm, plate_y_cm) * 2.0))
+
+    objective = 0.0
+
+    # Pair interaction: hot sources close together are bad.
+    for i, (ri, pi) in enumerate(zip(resistors, positions)):
+        xi, yi = pi
+        ri_eff_cm = max(0.2, math.sqrt((ri.length_mm / 10.0) * (ri.width_mm / 10.0) / math.pi))
+
+        local = ri.power_w / max(0.2, ri_eff_cm)
+
+        for j, (rj, pj) in enumerate(zip(resistors, positions)):
+            if i == j:
                 continue
-            if count == 1:
-                min_pair = min(plate_x_cm, plate_y_cm)
-            else:
-                min_pair = min(math.hypot(combo[i][0] - combo[j][0], combo[i][1] - combo[j][1]) for i in range(count) for j in range(i + 1, count))
-            center_penalty = sum(math.hypot(x, y) for x, y in combo) / max(count, 1)
-            aspect_penalty = abs(cols - rows) * 0.05
-            score = min_pair - 0.05 * center_penalty - aspect_penalty
+            xj, yj = pj
+            d = max(0.05, math.hypot(xi - xj, yi - yj))
+            # Exponential decay gives a stable approximation of "thermal influence".
+            local += rj.power_w * math.exp(-d / spread_len_cm) / math.sqrt(d + ri_eff_cm)
+
+        # Edge penalty. A source near an insulated/thin edge has less metal to
+        # spread into. Approximate that with mirrored heat sources across edges.
+        left = xi + plate_x_cm / 2.0 - ri.length_mm / 20.0
+        right = plate_x_cm / 2.0 - xi - ri.length_mm / 20.0
+        bottom = yi + plate_y_cm / 2.0 - ri.width_mm / 20.0
+        top = plate_y_cm / 2.0 - yi - ri.width_mm / 20.0
+
+        for edge_dist in (left, right, bottom, top):
+            edge_dist = max(0.05, edge_dist)
+            mirror_d = 2.0 * edge_dist
+            local += 0.45 * ri.power_w * math.exp(-mirror_d / spread_len_cm) / math.sqrt(mirror_d + ri_eff_cm)
+
+        # Optimize for the hottest source, not just the average.
+        objective = max(objective, local)
+
+    xs = [p[0] for p in positions]
+    ys = [p[1] for p in positions]
+
+    usable_x = max(0.1, plate_x_cm - 2.0 * margin_cm)
+    usable_y = max(0.1, plate_y_cm - 2.0 * margin_cm)
+    span_x = (max(xs) - min(xs)) / usable_x if len(xs) > 1 else 0.0
+    span_y = (max(ys) - min(ys)) / usable_y if len(ys) > 1 else 0.0
+
+    # Coverage penalty prevents the bad "all in one line" solution when the
+    # plate has room in both dimensions. This is the key fix compared with v5.
+    if len(resistors) >= 3 and usable_x > 8.0 and usable_y > 8.0:
+        desired_x = 0.65
+        desired_y = 0.65
+        coverage_penalty = total_power * (
+            max(0.0, desired_x - span_x) ** 2
+            + max(0.0, desired_y - span_y) ** 2
+        )
+        objective += 0.35 * coverage_penalty
+
+    # Keep the center of heat roughly near the center of the plate, unless
+    # asymmetrical resistor powers naturally pull it elsewhere.
+    heat_cx = sum(r.power_w * p[0] for r, p in zip(resistors, positions)) / total_power
+    heat_cy = sum(r.power_w * p[1] for r, p in zip(resistors, positions)) / total_power
+    objective += 0.05 * total_power * ((heat_cx / usable_x) ** 2 + (heat_cy / usable_y) ** 2)
+
+    return objective
+
+
+def _make_grid_layout(
+    resistors: List[Resistor],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+    rows: int,
+    cols: int,
+) -> Optional[List[Tuple[float, float]]]:
+    """Create a rows×cols layout and choose the best cells if there are extras."""
+    count = len(resistors)
+    if rows < 1 or cols < 1 or rows * cols < count:
+        return None
+
+    max_l_cm = max(r.length_mm for r in resistors) / 10.0
+    max_w_cm = max(r.width_mm for r in resistors) / 10.0
+
+    xmin = -plate_x_cm / 2.0 + max_l_cm / 2.0 + margin_cm
+    xmax =  plate_x_cm / 2.0 - max_l_cm / 2.0 - margin_cm
+    ymin = -plate_y_cm / 2.0 + max_w_cm / 2.0 + margin_cm
+    ymax =  plate_y_cm / 2.0 - max_w_cm / 2.0 - margin_cm
+
+    if xmin > xmax or ymin > ymax:
+        return None
+
+    xs = [0.0] if cols == 1 else list(np.linspace(xmin, xmax, cols))
+    ys = [0.0] if rows == 1 else list(np.linspace(ymin, ymax, rows))
+    cells = [(x, y) for y in ys for x in xs]
+
+    # Prefer using outer cells first when there are extra cells. This gives
+    # better spreading than simply taking the first N cells.
+    cells = sorted(cells, key=lambda p: math.hypot(p[0], p[1]), reverse=True)
+
+    if len(cells) <= 12 and len(cells) > count:
+        best = None
+        best_score = -1e99
+        for combo in itertools.combinations(cells, count):
+            combo = list(combo)
+            xs2 = [p[0] for p in combo]
+            ys2 = [p[1] for p in combo]
+            span = (max(xs2) - min(xs2)) + (max(ys2) - min(ys2))
+            balance = -abs((max(xs2) + min(xs2))) - abs((max(ys2) + min(ys2)))
+            min_pair = min(
+                math.hypot(combo[i][0] - combo[j][0], combo[i][1] - combo[j][1])
+                for i in range(count)
+                for j in range(i + 1, count)
+            ) if count > 1 else 0.0
+            score = 2.0 * min_pair + 0.3 * span + 0.2 * balance
             if score > best_score:
                 best_score = score
-                best_positions = combo
-    if best_positions is None:
+                best = combo
+        cells = best if best is not None else cells[:count]
+    else:
+        cells = cells[:count]
+
+    # Assign highest power resistors to the cells with most spreading room.
+    # For equal power, this simply preserves a stable ordering.
+    order = sorted(range(count), key=lambda i: resistors[i].power_w, reverse=True)
+    cells_sorted = sorted(cells, key=lambda p: min(
+        p[0] + plate_x_cm / 2.0,
+        plate_x_cm / 2.0 - p[0],
+        p[1] + plate_y_cm / 2.0,
+        plate_y_cm / 2.0 - p[1],
+    ), reverse=True)
+
+    assigned = [None] * count
+    for res_i, pos in zip(order, cells_sorted):
+        assigned[res_i] = pos
+
+    if not _layout_is_valid(resistors, assigned, plate_x_cm, plate_y_cm, margin_cm):
+        return None
+
+    return assigned
+
+
+def evenly_spaced_positions(
+    count: int,
+    plate_x_cm: float,
+    plate_y_cm: float,
+    footprint_l_mm: float,
+    footprint_w_mm: float,
+    margin_cm: float = 1.0,
+) -> List[Tuple[float, float]]:
+    """
+    Return an even 2D layout.
+
+    v5.2 fix:
+    The previous version often preferred a single line because it maximized
+    nearest-neighbor distance. This version also considers plate aspect ratio
+    and uses both dimensions when the plate has room.
+    """
+    if count <= 0:
+        return []
+
+    dummy = [
+        Resistor(f"R{i + 1}", 1.0, 0.0, 0.0, footprint_l_mm, footprint_w_mm)
+        for i in range(count)
+    ]
+
+    best = None
+    best_score = -1e99
+    target_aspect = max(0.01, plate_x_cm / max(0.01, plate_y_cm))
+
+    for rows in range(1, count + 1):
+        for cols in range(1, count + 1):
+            if rows * cols < count:
+                continue
+
+            layout = _make_grid_layout(dummy, plate_x_cm, plate_y_cm, margin_cm, rows, cols)
+            if layout is None:
+                continue
+
+            grid_aspect = cols / rows
+            unused = rows * cols - count
+            xs = [p[0] for p in layout]
+            ys = [p[1] for p in layout]
+            span_x = max(xs) - min(xs) if len(xs) > 1 else 0.0
+            span_y = max(ys) - min(ys) if len(ys) > 1 else 0.0
+            min_pair = min(
+                math.hypot(layout[i][0] - layout[j][0], layout[i][1] - layout[j][1])
+                for i in range(count)
+                for j in range(i + 1, count)
+            ) if count > 1 else 0.0
+
+            # Prefer grid aspect matching plate aspect, low unused cells, and
+            # actual 2D coverage.
+            aspect_error = abs(math.log(max(0.01, grid_aspect / target_aspect)))
+            coverage = span_x + span_y
+            score = 1.2 * min_pair + 0.25 * coverage - 2.0 * aspect_error - 0.5 * unused
+
+            if score > best_score:
+                best_score = score
+                best = layout
+
+    if best is None:
         raise ValueError("Could not create an even layout.")
-    return list(best_positions[:count])
+
+    return best
 
 
-def candidate_layouts_for_count(count: int, plate_x_cm: float, plate_y_cm: float, footprint_l_mm: float, footprint_w_mm: float, margin_cm: float) -> List[List[Tuple[float, float]]]:
-    """Generate several sensible candidate layouts for optimization."""
-    layouts = []
+def candidate_layouts_for_count(
+    count: int,
+    plate_x_cm: float,
+    plate_y_cm: float,
+    footprint_l_mm: float,
+    footprint_w_mm: float,
+    margin_cm: float,
+) -> List[List[Tuple[float, float]]]:
+    """
+    Generate sensible candidate layouts.
+
+    Kept for compatibility, but improved in v5.2.
+    """
+    dummy = [
+        Resistor(f"R{i + 1}", 1.0, 0.0, 0.0, footprint_l_mm, footprint_w_mm)
+        for i in range(count)
+    ]
+    return generate_candidate_layouts(dummy, plate_x_cm, plate_y_cm, margin_cm)
+
+
+def generate_candidate_layouts(
+    resistors: List[Resistor],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+) -> List[List[Tuple[float, float]]]:
+    """Generate many deterministic starting layouts for the optimizer."""
+    count = len(resistors)
+    layouts: List[List[Tuple[float, float]]] = []
     seen = set()
-    def add(pos):
-        key = tuple((round(x, 3), round(y, 3)) for x, y in pos)
+
+    def add(layout):
+        if layout is None:
+            return
+        if not _layout_is_valid(resistors, layout, plate_x_cm, plate_y_cm, margin_cm):
+            return
+        key = tuple((round(x, 3), round(y, 3)) for x, y in layout)
         if key not in seen:
             seen.add(key)
-            layouts.append(pos)
-    for m in [margin_cm, max(0.0, margin_cm / 2.0), margin_cm + 1.0, margin_cm + 2.0, 0.0]:
+            layouts.append(layout)
+
+    # Current-ish geometrical grids.
+    for rows in range(1, count + 1):
+        for cols in range(1, count + 1):
+            if rows * cols >= count:
+                add(_make_grid_layout(resistors, plate_x_cm, plate_y_cm, margin_cm, rows, cols))
+
+    # Try different margins. Sometimes being slightly less close to the edge
+    # wins thermally even if the official margin is small.
+    max_l = max(r.length_mm for r in resistors)
+    max_w = max(r.width_mm for r in resistors)
+    for m in [margin_cm, margin_cm + 1.0, margin_cm + 2.0, max(0.0, margin_cm / 2.0), 0.0]:
         try:
-            add(evenly_spaced_positions(count, plate_x_cm, plate_y_cm, footprint_l_mm, footprint_w_mm, m))
+            pos = evenly_spaced_positions(count, plate_x_cm, plate_y_cm, max_l, max_w, m)
+            if _layout_is_valid(resistors, pos, plate_x_cm, plate_y_cm, margin_cm):
+                add(pos)
         except Exception:
             pass
-    half_l_cm = footprint_l_mm / 20.0
-    half_w_cm = footprint_w_mm / 20.0
-    xmin = -plate_x_cm / 2.0 + half_l_cm + margin_cm
-    xmax =  plate_x_cm / 2.0 - half_l_cm - margin_cm
-    ymin = -plate_y_cm / 2.0 + half_w_cm + margin_cm
-    ymax =  plate_y_cm / 2.0 - half_w_cm - margin_cm
-    if xmin <= xmax:
-        xs = [0.0] if count == 1 else list(np.linspace(xmin, xmax, count))
-        add([(x, 0.0) for x in xs])
-    if ymin <= ymax:
-        ys = [0.0] if count == 1 else list(np.linspace(ymin, ymax, count))
-        add([(0.0, y) for y in ys])
+
+    # Ring / ellipse layout, useful for 3+ sources.
+    if count >= 3:
+        max_l_cm = max(r.length_mm for r in resistors) / 10.0
+        max_w_cm = max(r.width_mm for r in resistors) / 10.0
+        rx = max(0.1, plate_x_cm / 2.0 - max_l_cm / 2.0 - margin_cm)
+        ry = max(0.1, plate_y_cm / 2.0 - max_w_cm / 2.0 - margin_cm)
+
+        for scale in [0.55, 0.70, 0.85]:
+            layout = []
+            for i in range(count):
+                angle = 2.0 * math.pi * i / count
+                layout.append((scale * rx * math.cos(angle), scale * ry * math.sin(angle)))
+            add(layout)
+
+            # Rotated version.
+            layout = []
+            for i in range(count):
+                angle = 2.0 * math.pi * (i + 0.5) / count
+                layout.append((scale * rx * math.cos(angle), scale * ry * math.sin(angle)))
+            add(layout)
+
     return layouts
+
+
+def optimize_layout_fast(
+    resistors: List[Resistor],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    k_w_mk: float,
+    thickness_mm: float,
+    h_w_m2k: float,
+    margin_cm: float,
+    progress_callback=None,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[List[Tuple[float, float]], float, int]:
+    """
+    Improved v5.2 optimizer.
+
+    Uses:
+      1. deterministic grid/ellipse candidates
+      2. random valid starts
+      3. simulated-annealing style local movement
+
+    The objective is a fast thermal-interaction estimate. The full simulation
+    should still be run afterward for the final result.
+    """
+    count = len(resistors)
+    if count == 0:
+        raise ValueError("No resistors to optimize.")
+
+    rng = np.random.default_rng(12345)
+
+    candidates = generate_candidate_layouts(resistors, plate_x_cm, plate_y_cm, margin_cm)
+
+    bounds = [_center_bounds_for_resistor(r, plate_x_cm, plate_y_cm, margin_cm) for r in resistors]
+
+    def random_layout(max_attempts=4000):
+        positions = []
+        order = sorted(range(count), key=lambda i: resistors[i].power_w, reverse=True)
+        assigned = [None] * count
+
+        for idx in order:
+            xmin, xmax, ymin, ymax = bounds[idx]
+            placed = False
+            for _ in range(max_attempts):
+                p = (float(rng.uniform(xmin, xmax)), float(rng.uniform(ymin, ymax)))
+                ok = True
+                for j in range(count):
+                    if assigned[j] is None:
+                        continue
+                    if _rectangles_overlap(resistors[idx], p, resistors[j], assigned[j], 0.15):
+                        ok = False
+                        break
+                if ok:
+                    assigned[idx] = p
+                    placed = True
+                    break
+            if not placed:
+                return None
+
+        return assigned
+
+    # Add random starts.
+    random_start_count = min(250, max(50, 25 * count))
+    for _ in range(random_start_count):
+        layout = random_layout()
+        if layout is not None and _layout_is_valid(resistors, layout, plate_x_cm, plate_y_cm, margin_cm):
+            candidates.append(layout)
+
+    best_layout = None
+    best_score = float("inf")
+    tried = 0
+
+    def score(layout):
+        return _thermal_interaction_objective(
+            resistors=resistors,
+            positions=layout,
+            plate_x_cm=plate_x_cm,
+            plate_y_cm=plate_y_cm,
+            k_w_mk=k_w_mk,
+            thickness_mm=thickness_mm,
+            h_w_m2k=h_w_m2k,
+            margin_cm=margin_cm,
+        )
+
+    # Evaluate starts.
+    unique = []
+    seen = set()
+    for layout in candidates:
+        key = tuple((round(x, 2), round(y, 2)) for x, y in layout)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(layout)
+
+    for layout in unique:
+        tried += 1
+        s = score(layout)
+        if s < best_score:
+            best_score = s
+            best_layout = [tuple(p) for p in layout]
+
+    if best_layout is None:
+        raise ValueError("Could not find any valid starting layout.")
+
+    # Local improvement from the best several starts.
+    starts = sorted(unique, key=score)[:min(12, len(unique))]
+    max_span = max(plate_x_cm, plate_y_cm)
+    moves_per_start = max(600, 250 * count)
+
+    for start_i, start in enumerate(starts, 1):
+        current = [tuple(p) for p in start]
+        current_score = score(current)
+        step_cm = max(1.0, max_span * 0.18)
+        temperature = max(0.1, current_score * 0.08)
+
+        for move in range(moves_per_start):
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Optimization was cancelled.")
+
+            i = int(rng.integers(0, count))
+            xmin, xmax, ymin, ymax = bounds[i]
+            old_p = current[i]
+
+            # Mix small nudges and total repositions.
+            if rng.random() < 0.15:
+                new_p = (float(rng.uniform(xmin, xmax)), float(rng.uniform(ymin, ymax)))
+            else:
+                new_p = (
+                    float(min(xmax, max(xmin, old_p[0] + rng.normal(0.0, step_cm)))),
+                    float(min(ymax, max(ymin, old_p[1] + rng.normal(0.0, step_cm)))),
+                )
+
+            trial = list(current)
+            trial[i] = new_p
+
+            if not _layout_is_valid(resistors, trial, plate_x_cm, plate_y_cm, margin_cm):
+                continue
+
+            trial_score = score(trial)
+            tried += 1
+
+            accept = trial_score < current_score
+            if not accept:
+                # Annealing escape from local minima.
+                delta = trial_score - current_score
+                if rng.random() < math.exp(-delta / max(1e-9, temperature)):
+                    accept = True
+
+            if accept:
+                current = trial
+                current_score = trial_score
+
+                if current_score < best_score:
+                    best_score = current_score
+                    best_layout = [tuple(p) for p in current]
+
+            step_cm *= 0.996
+            temperature *= 0.997
+
+        if progress_callback is not None:
+            progress_callback(
+                f"Optimizer refined start {start_i}/{len(starts)}. "
+                f"Best score: {best_score:.3f}. Tried {tried} layouts/moves."
+            )
+
+    return best_layout, best_score, tried
+
 
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Thermal Plate Simulator v5.1")
+        self.title("Thermal Plate Simulator v5.2")
         self.geometry("1280x820")
         self.minsize(1120, 720)
 
@@ -1409,7 +1891,11 @@ class ThermalPlateGUI(tk.Tk):
             messagebox.showinfo("Optimizer", "Add at least two resistors to optimize spacing.")
             return
         self._optimization_running = True
-        self._set_status("Optimizer running. It will try several even layouts and pick the lowest steady-state max temperature.")
+        self._set_status(
+            "Optimizer running. v5.2 uses a thermal-interaction placement search, "
+            "not just a few fixed layouts. It tries to reduce source interaction, "
+            "avoid bad edge placement, and use both plate dimensions."
+        )
         def worker():
             try:
                 best_positions, best_temp, tried = self._optimize_locations_worker(cfg)
@@ -1420,51 +1906,24 @@ class ThermalPlateGUI(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _optimize_locations_worker(self, cfg: PlateConfig):
-        count = len(cfg.resistors)
-        max_l = max(r.length_mm for r in cfg.resistors)
-        max_w = max(r.width_mm for r in cfg.resistors)
         try:
             margin_cm = parse_float(self.bank_margin_var.get(), "Bank margin", 0.0)
         except Exception:
             margin_cm = 1.0
-        layouts = candidate_layouts_for_count(count, cfg.plate_length_cm, cfg.plate_width_cm, max_l, max_w, margin_cm)
-        if not layouts:
-            raise ValueError("No candidate layouts fit on the plate.")
-        opt_cfg = PlateConfig(**asdict(cfg))
-        opt_cfg.grid_mm = max(cfg.grid_mm, 8.0)
-        opt_cfg.max_time_s = 60.0
-        opt_cfg.snapshot_every_s = 60.0
-        opt_cfg.include_steady_state = True
-        best_positions = None
-        best_temp = float("inf")
-        tried = 0
-        orders = [list(range(count))]
-        by_power = sorted(range(count), key=lambda i: cfg.resistors[i].power_w, reverse=True)
-        if by_power != orders[0]:
-            orders.append(by_power)
-        for layout in layouts:
-            for order in orders:
-                tried += 1
-                test_res = [Resistor(**asdict(r)) for r in cfg.resistors]
-                sorted_positions = sorted(layout, key=lambda p: math.hypot(p[0], p[1]))
-                assigned = [None] * count
-                for pos_i, res_i in enumerate(order):
-                    assigned[res_i] = sorted_positions[pos_i]
-                for i, pos in enumerate(assigned):
-                    test_res[i].center_x_cm = pos[0]
-                    test_res[i].center_y_cm = pos[1]
-                opt_cfg.resistors = test_res
-                x, y, dx, dy = build_grid(opt_cfg)
-                q, _masks = add_heat_sources(opt_cfg, x, y, dx, dy)
-                temp, _info = solve_steady_state(opt_cfg, q, dx, dy, progress_callback=None, stop_event=self.stop_event, max_iter=9000, tolerance_c=0.01)
-                max_temp = float(np.max(temp))
-                if max_temp < best_temp:
-                    best_temp = max_temp
-                    best_positions = assigned
-                self.msg_queue.put(("progress", f"Optimizer tried {tried} layouts. Best max so far: {best_temp:.1f} °C"))
-        if best_positions is None:
-            raise ValueError("Optimizer did not find a valid layout.")
-        return best_positions, best_temp, tried
+
+        positions, best_score, tried = optimize_layout_fast(
+            resistors=cfg.resistors,
+            plate_x_cm=cfg.plate_length_cm,
+            plate_y_cm=cfg.plate_width_cm,
+            k_w_mk=cfg.thermal_conductivity_w_mk,
+            thickness_mm=cfg.plate_thickness_mm,
+            h_w_m2k=cfg.convection_h_w_m2k,
+            margin_cm=margin_cm,
+            progress_callback=lambda msg: self.msg_queue.put(("progress", msg)),
+            stop_event=self.stop_event,
+        )
+
+        return positions, best_score, tried
 
     def _apply_optimized_positions(self, positions: List[Tuple[float, float]], best_temp: float, tried: int):
         for r, (x, y) in zip(self.resistors, positions):
@@ -1473,9 +1932,10 @@ class ThermalPlateGUI(tk.Tk):
         self._refresh_resistor_tree()
         self._schedule_preview_update()
         self._set_status(
-            f"Optimizer finished. Tried {tried} candidate layouts.\n"
-            f"Best coarse steady-state max estimate: {best_temp:.1f} °C.\n\n"
-            "Positions have been applied. Run the full simulation for the final detailed result."
+            f"Optimizer finished. Tried/evaluated {tried} candidate layouts and local moves.\n"
+            f"Best thermal-interaction score: {best_temp:.3f}  lower is better.\n\n"
+            "Positions have been applied. Run the full simulation for the actual temperature result.\n"
+            "This optimizer is designed to avoid bad one-line layouts when the plate has usable space in both dimensions."
         )
 
     def _estimate_h_from_ui(self) -> Tuple[float, str]:
