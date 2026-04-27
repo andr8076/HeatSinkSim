@@ -1,4 +1,4 @@
-Thermal Plate Simulator v11
+Thermal Plate Simulator v12
 ===========================
 
 This package is intended to run on:
@@ -11,7 +11,7 @@ Main files
 ----------
 
 - run_thermal_sim.py              Cross-platform launcher
-- thermal_plate_sim_v11_gui.py    GUI
+- thermal_plate_sim_v12_gui.py    GUI
 - thermal_core.py                 Simulation engine
 - requirements.txt                Python dependencies
 
@@ -82,7 +82,7 @@ On Arch/EndeavourOS:
     sudo pacman -S tk
 
 
-v11 changes
+v12 changes
 --------------------------
 
 - macOS Tk warning suppression.
@@ -106,3 +106,18 @@ Notes
 -----
 
 The simulator is still an engineering approximation. For real resistor dump hardware, use a temperature sensor, fuses, and thermal cutoff.
+
+
+v12 changes
+-----------
+- Improved 3D resistor visibility:
+  - transparent plate mode
+  - exploded view mode
+  - resistor outlines drawn last for easier visibility from awkward angles
+- Improved fin heat-transfer resolution:
+  - fins are split into local thermal segments along the run length
+  - the solver applies cooling locally per segment instead of one coarse full-fin strip
+  - the 3D viewer colors fin segments from local plate temperature
+- Heatsink dialog now includes "Thermal segments":
+  - auto = recommended
+  - a number forces that many segments per fin

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v9_gui.py
+thermal_plate_sim_v12_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
-Adds live layout preview, advanced cooling, geometry heatsink builder, even-spread banks, and a deeper multi-worker optimizer.
+Adds live layout preview, advanced cooling, geometry heatsink builder, segmented fin transfer, even-spread banks, and a deeper multi-worker optimizer.
 
 Features:
   - Tkinter UI
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v9_gui.py
+  python3 thermal_plate_sim_v12_gui.py
 """
 
 from __future__ import annotations
@@ -143,6 +143,7 @@ class PlateConfig:
     heatsink_fin_run_length_cm: float = 0.0  # 0 = full available plate dimension
     heatsink_fin_positions_cm: str = "even"  # "even" or comma-separated centers
     heatsink_fin_heights_mm: str = "same"    # "same" or comma-separated heights
+    heatsink_fin_segments: int = 0            # 0 = auto; split each fin along its run length for local cooling resolution
 
 
 @dataclass
@@ -381,6 +382,71 @@ def fin_efficiency_for_spec(cfg: "PlateConfig", spec: Dict) -> float:
     return max(0.0, min(1.0, math.tanh(ml) / ml))
 
 
+def _auto_fin_segment_count(cfg: "PlateConfig", spec: Dict, dx_m=None, dy_m=None) -> int:
+    """Choose a sensible number of local thermal segments for one fin."""
+    requested = int(max(0, round(float(getattr(cfg, "heatsink_fin_segments", 0) or 0))))
+    if requested > 0:
+        return max(1, min(240, requested))
+
+    run_cm = max(0.001, float(spec["run_length_cm"]))
+    orientation = spec.get("orientation", "run_y")
+
+    if dx_m is not None and dy_m is not None:
+        run_cell_cm = (dy_m if orientation == "run_y" else dx_m) * 100.0
+        target_cm = max(0.8, min(3.0, run_cell_cm * 2.0))
+    else:
+        target_cm = 2.0
+
+    return max(1, min(120, int(math.ceil(run_cm / target_cm))))
+
+
+def heatsink_fin_segment_specs(cfg: "PlateConfig", dx_m=None, dy_m=None) -> List[Dict]:
+    """Split every fin into local run-length segments.
+
+    v12 improvement:
+    Older versions treated a full-length fin as one large cooling footprint.
+    That was too coarse when a fin crossed both hot and cool parts of the plate.
+    This distributes the same total fin conductance over smaller local segments,
+    giving a better heat-transfer map and a better 3D visualization.
+    """
+    segments: List[Dict] = []
+
+    for spec in heatsink_fin_specs(cfg):
+        n = _auto_fin_segment_count(cfg, spec, dx_m=dx_m, dy_m=dy_m)
+        n = max(1, int(n))
+
+        orientation = spec.get("orientation", "run_y")
+        run_len_cm = float(spec["run_length_cm"])
+        seg_run_cm = run_len_cm / n
+        eta = fin_efficiency_for_spec(cfg, spec)
+
+        for j in range(n):
+            offset_cm = -run_len_cm / 2.0 + seg_run_cm * (j + 0.5)
+            seg = dict(spec)
+            seg["parent_index"] = spec.get("index")
+            seg["segment_index"] = j + 1
+            seg["segment_count"] = n
+            seg["full_fin_efficiency"] = eta
+            seg["run_length_cm"] = seg_run_cm
+            seg["raw_area_m2"] = spec["raw_area_m2"] / n
+            seg["footprint_m2"] = spec["footprint_m2"] / n
+
+            if orientation == "run_y":
+                seg["center_x_cm"] = spec["center_x_cm"]
+                seg["center_y_cm"] = spec["center_y_cm"] + offset_cm
+                seg["footprint_x_cm"] = spec["footprint_x_cm"]
+                seg["footprint_y_cm"] = seg_run_cm
+            else:
+                seg["center_x_cm"] = spec["center_x_cm"] + offset_cm
+                seg["center_y_cm"] = spec["center_y_cm"]
+                seg["footprint_x_cm"] = seg_run_cm
+                seg["footprint_y_cm"] = spec["footprint_y_cm"]
+
+            segments.append(seg)
+
+    return segments
+
+
 def heatsink_geometry_summary(cfg: "PlateConfig") -> Dict:
     specs = heatsink_fin_specs(cfg)
     raw_area_cm2 = 0.0
@@ -407,6 +473,7 @@ def heatsink_geometry_summary(cfg: "PlateConfig") -> Dict:
         "footprint_area_cm2": footprint_cm2,
         "effective_extra_area_cm2": effective_extra_cm2,
         "average_fin_efficiency_percent": (100.0 * sum(effs) / len(effs)) if effs else 0.0,
+        "thermal_segment_count": len(heatsink_fin_segment_specs(cfg)),
         "fins": specs,
     }
 
@@ -464,7 +531,9 @@ def cooling_loss_coeff_map(cfg: "PlateConfig", shape: Tuple[int, int], dx_m: flo
     X, Y = np.meshgrid(x, y, indexing="ij")
     cell_area = dx_m * dy_m
 
-    for spec in heatsink_fin_specs(cfg):
+    # v12: apply fin cooling in local run-length segments instead of one
+    # low-resolution full-fin strip. Total fin conductance is conserved.
+    for spec in heatsink_fin_segment_specs(cfg, dx_m=dx_m, dy_m=dy_m):
         cx = spec["center_x_cm"] / 100.0
         cy = spec["center_y_cm"] / 100.0
         hx = (spec["footprint_x_cm"] / 100.0) / 2.0
@@ -476,7 +545,7 @@ def cooling_loss_coeff_map(cfg: "PlateConfig", shape: Tuple[int, int], dx_m: flo
             mask[ix, iy] = True
 
         covered_area = float(np.count_nonzero(mask) * cell_area)
-        eta = fin_efficiency_for_spec(cfg, spec)
+        eta = float(spec.get("full_fin_efficiency", fin_efficiency_for_spec(cfg, spec)))
         fin_conductance_w_k = base_h * eta * spec["raw_area_m2"]
 
         # Base map already counted the back face under the fin. That area is

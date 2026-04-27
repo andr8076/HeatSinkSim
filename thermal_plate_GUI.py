@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v11_gui.py
+thermal_plate_sim_v12_gui.py
 
-Cross-platform thermal plate simulator with geometry heatsink builder, 3D heatmap viewer, and multi-worker optimization.
+Cross-platform thermal plate simulator with segmented fin transfer, improved 3D viewer, and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
 
 Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v11_gui.py
+    python thermal_plate_sim_v12_gui.py
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ from thermal_core import (
     fin_efficiency_for_spec,
     format_time,
     heatsink_fin_specs,
+    heatsink_fin_segment_specs,
     heatsink_geometry_summary,
     key_from_display,
     optimize_layout_deep,
@@ -75,7 +76,7 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v11")
+        self.title("Thermal Plate Simulator v12")
 
         # Cross-platform initial window sizing.
         # macOS laptops and smaller Linux/Windows screens can be shorter than
@@ -169,8 +170,8 @@ class ThermalPlateGUI(tk.Tk):
             help_menu.add_command(
                 label="About",
                 command=lambda: messagebox.showinfo(
-                    "Thermal Plate Simulator v11",
-                    "Thermal Plate Simulator v11\nCross-platform GUI for Windows, macOS, and Linux."
+                    "Thermal Plate Simulator v12",
+                    "Thermal Plate Simulator v12\nCross-platform GUI for Windows, macOS, and Linux."
                 )
             )
             menubar.add_cascade(label="Help", menu=help_menu)
@@ -228,6 +229,7 @@ class ThermalPlateGUI(tk.Tk):
         self.heatsink_fin_run_length_var = tk.StringVar(value="full")
         self.heatsink_fin_positions_var = tk.StringVar(value="even")
         self.heatsink_fin_heights_var = tk.StringVar(value="same")
+        self.heatsink_fin_segments_var = tk.StringVar(value="auto")
         self.heatsink_label_var = tk.StringVar(value="No heatsink / extra fins")
 
         self.r_name_var = tk.StringVar(value="R1")
@@ -509,10 +511,10 @@ Balanced is faster. Deep is the normal choice. Extreme searches harder and can t
 Always run the full simulation after optimizing.
 
 3D viewer
-Open 3D viewer after a simulation to see the heatmapped plate, back-side fins, and resistor blocks. The resistor side control is visual; the 2D thermal model is still through the same thin plate.
+Open 3D viewer after a simulation to see the heatmapped plate, back-side fins, and resistor blocks. v12 adds transparent/exploded viewing and resistor outlines, so backside resistors are much easier to see from awkward angles. The resistor side control is visual; the 2D thermal model is still through the same thin plate.
 
-Fin layout
-Use the heatsink dialog's Fin layout designer for individual fin positions and heights. Even fills the available width. Place fins near resistors clusters fins under/near heat sources along the fin spread axis.
+Fin layout and fin heat transfer
+Use the heatsink dialog's Fin layout designer for individual fin positions and heights. Even fills the available width. Place fins near resistors clusters fins under/near heat sources along the fin spread axis. Thermal segments controls how finely each fin is split along its length for local heat-transfer calculation. Use auto unless you specifically need more detail.
 """.strip())
         t.configure(state="disabled")
 
@@ -541,7 +543,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             self.heatsink_enabled_var,self.heatsink_mode_var,self.heatsink_area_var,self.heatsink_eff_var,self.heatsink_hmul_var,
             self.heatsink_fin_orientation_var,self.heatsink_fin_count_var,self.heatsink_fin_thickness_var,
             self.heatsink_fin_height_var,self.heatsink_fin_run_length_var,self.heatsink_fin_positions_var,
-            self.heatsink_fin_heights_var
+            self.heatsink_fin_heights_var,self.heatsink_fin_segments_var
         ]:
             var.trace_add("write", lambda *a: (self._update_heatsink_label(), self._schedule_preview()))
         self.resistor_side_var.trace_add("write", lambda *a: self._schedule_preview())
@@ -609,6 +611,13 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             return default
         return parse_float(raw, "value", 0.0)
 
+    def _int_or_zero_for_auto(self, value: str) -> int:
+        raw = str(value or "").strip().lower()
+        if raw in ("", "auto", "same", "full"):
+            return 0
+        return max(0, int(round(parse_float(raw, "segments", 0))))
+
+
     def _update_heatsink_label(self):
         try:
             if not self.heatsink_enabled_var.get():
@@ -622,7 +631,8 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                     self.heatsink_label_var.set("Geometry heatsink enabled, but no fins calculated")
                     return
                 self.heatsink_label_var.set(
-                    f"{summary['fin_count']} fins, raw area {summary['raw_fin_area_cm2']:.0f} cm², "
+                    f"{summary['fin_count']} fins / {summary.get('thermal_segment_count', 0)} thermal segments, "
+                    f"raw area {summary['raw_fin_area_cm2']:.0f} cm², "
                     f"effective extra ≈ {summary['effective_extra_area_cm2']:.0f} cm², "
                     f"avg fin η {summary['average_fin_efficiency_percent']:.0f}%"
                 )
@@ -680,6 +690,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             heatsink_fin_run_length_cm=run_len,
             heatsink_fin_positions_cm=self.heatsink_fin_positions_var.get(),
             heatsink_fin_heights_mm=self.heatsink_fin_heights_var.get(),
+            heatsink_fin_segments=self._int_or_zero_for_auto(self.heatsink_fin_segments_var.get()),
             heatsink_extra_area_cm2=parse_float(self.heatsink_area_var.get(),"Heatsink extra area",0.0),
             heatsink_efficiency_percent=parse_float(self.heatsink_eff_var.get(),"Heatsink efficiency",0.0),
             heatsink_h_multiplier=parse_float(self.heatsink_hmul_var.get(),"Heatsink h multiplier",0.0),
@@ -709,13 +720,14 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
         self._entry_row(geom,4,"Fin run length cm",self.heatsink_fin_run_length_var)
         self._entry_row(geom,5,"Fin positions cm",self.heatsink_fin_positions_var)
         self._entry_row(geom,6,"Individual heights mm",self.heatsink_fin_heights_var)
+        self._entry_row(geom,7,"Thermal segments",self.heatsink_fin_segments_var)
         ttk.Label(
             geom,
             text="Use 'same' for fin thickness to match the base plate. Use 'full' for run length to span the plate. "
-                 "Positions: 'even' or comma-separated centers. Heights: 'same' or comma-separated values.",
+                 "Positions: 'even' or comma-separated centers. Heights: 'same' or comma-separated values. Thermal segments: use 'auto' unless you want to force a specific segment count per fin.",
             foreground="#555",wraplength=420,justify="left"
-        ).grid(row=7,column=0,columnspan=2,sticky="w",pady=(8,0))
-        fin_btns=ttk.Frame(geom); fin_btns.grid(row=8,column=0,columnspan=2,sticky="ew",pady=(8,0))
+        ).grid(row=8,column=0,columnspan=2,sticky="w",pady=(8,0))
+        fin_btns=ttk.Frame(geom); fin_btns.grid(row=9,column=0,columnspan=2,sticky="ew",pady=(8,0))
         ttk.Button(fin_btns,text="Fin layout designer...",command=self._open_fin_layout_designer).pack(side="left",padx=(0,4))
         ttk.Button(fin_btns,text="Even fins",command=self._set_fins_even).pack(side="left",padx=(0,4))
         ttk.Button(fin_btns,text="Place fins near resistors",command=self._set_fins_near_resistors).pack(side="left")
@@ -776,6 +788,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             heatsink_fin_run_length_cm=self._float_or_zero_for_full_same(self.heatsink_fin_run_length_var.get(),0.0),
             heatsink_fin_positions_cm=self.heatsink_fin_positions_var.get(),
             heatsink_fin_heights_mm=self.heatsink_fin_heights_var.get(),
+            heatsink_fin_segments=self._int_or_zero_for_auto(self.heatsink_fin_segments_var.get()),
         )
         if cfg.snapshot_every_s > cfg.max_time_s: raise ValueError("Snapshot interval cannot be greater than max time.")
         if not cfg.resistors: raise ValueError("Add at least one resistor.")
@@ -1004,7 +1017,7 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             self._append_status(f"Loaded config: {path}")
         except Exception as e: messagebox.showerror("Load failed",str(e))
     def _apply_config(self,cfg):
-        self.plate_width_x_var.set(f"{cfg.plate_length_cm:g}"); self.plate_height_y_var.set(f"{cfg.plate_width_cm:g}"); self.plate_thickness_var.set(f"{cfg.plate_thickness_mm:g}"); self.material_var.set(cfg.material_name); self.k_var.set(f"{cfg.thermal_conductivity_w_mk:g}"); self.rho_var.set(f"{cfg.density_kg_m3:g}"); self.cp_var.set(f"{cfg.heat_capacity_j_kgk:g}"); self.ambient_var.set(f"{cfg.ambient_c:g}"); self.h_var.set(f"{cfg.convection_h_w_m2k:g}"); self.grid_var.set(f"{cfg.grid_mm:g}"); self.initial_temp_var.set(f"{cfg.initial_plate_temp_c:g}"); self.max_time_var.set(format_time(cfg.max_time_s).replace(' ','')); self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(' ','')); self.include_steady_var.set(cfg.include_steady_state); self.advanced_cooling_var.set(getattr(cfg,'advanced_cooling_enabled',False)); self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS,getattr(cfg,'orientation','vertical'))); self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS,getattr(cfg,'environment','open_air'))); self.clearance_var.set(f"{getattr(cfg,'wall_clearance_cm',20):g}"); self.surface_var.set(display_from_key(SURFACE_OPTIONS,getattr(cfg,'surface_finish','bare_metal'))); self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS,getattr(cfg,'air_movement','still_air'))); self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS,getattr(cfg,'hot_air_path','free_rise'))); self.blockage_var.set(f"{getattr(cfg,'blockage_percent',0):g}"); self.heatsink_enabled_var.set(getattr(cfg,'heatsink_enabled',False)); self.heatsink_mode_var.set("Geometry builder" if getattr(cfg,'heatsink_geometry_enabled',False) else "Simple extra area"); self.heatsink_area_var.set(f"{getattr(cfg,'heatsink_extra_area_cm2',0):g}"); self.heatsink_eff_var.set(f"{getattr(cfg,'heatsink_efficiency_percent',70):g}"); self.heatsink_hmul_var.set(f"{getattr(cfg,'heatsink_h_multiplier',1):g}"); self.heatsink_fin_orientation_var.set("Fins run along X, spread across Y" if getattr(cfg,'heatsink_fin_orientation','run_y')=='run_x' else "Fins run along Y, spread across X"); self.heatsink_fin_count_var.set(f"{getattr(cfg,'heatsink_fin_count',0):g}"); self.heatsink_fin_thickness_var.set("same" if getattr(cfg,'heatsink_fin_thickness_mm',0)<=0 else f"{getattr(cfg,'heatsink_fin_thickness_mm',0):g}"); self.heatsink_fin_height_var.set(f"{getattr(cfg,'heatsink_fin_default_height_mm',30):g}"); self.heatsink_fin_run_length_var.set("full" if getattr(cfg,'heatsink_fin_run_length_cm',0)<=0 else f"{getattr(cfg,'heatsink_fin_run_length_cm',0):g}"); self.heatsink_fin_positions_var.set(getattr(cfg,'heatsink_fin_positions_cm','even')); self.heatsink_fin_heights_var.set(getattr(cfg,'heatsink_fin_heights_mm','same')); self.resistors=list(cfg.resistors); self._refresh_resistor_tree(); self._update_material_fields(); self._update_h_label(); self._update_heatsink_label(); self._draw_layout_preview()
+        self.plate_width_x_var.set(f"{cfg.plate_length_cm:g}"); self.plate_height_y_var.set(f"{cfg.plate_width_cm:g}"); self.plate_thickness_var.set(f"{cfg.plate_thickness_mm:g}"); self.material_var.set(cfg.material_name); self.k_var.set(f"{cfg.thermal_conductivity_w_mk:g}"); self.rho_var.set(f"{cfg.density_kg_m3:g}"); self.cp_var.set(f"{cfg.heat_capacity_j_kgk:g}"); self.ambient_var.set(f"{cfg.ambient_c:g}"); self.h_var.set(f"{cfg.convection_h_w_m2k:g}"); self.grid_var.set(f"{cfg.grid_mm:g}"); self.initial_temp_var.set(f"{cfg.initial_plate_temp_c:g}"); self.max_time_var.set(format_time(cfg.max_time_s).replace(' ','')); self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(' ','')); self.include_steady_var.set(cfg.include_steady_state); self.advanced_cooling_var.set(getattr(cfg,'advanced_cooling_enabled',False)); self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS,getattr(cfg,'orientation','vertical'))); self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS,getattr(cfg,'environment','open_air'))); self.clearance_var.set(f"{getattr(cfg,'wall_clearance_cm',20):g}"); self.surface_var.set(display_from_key(SURFACE_OPTIONS,getattr(cfg,'surface_finish','bare_metal'))); self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS,getattr(cfg,'air_movement','still_air'))); self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS,getattr(cfg,'hot_air_path','free_rise'))); self.blockage_var.set(f"{getattr(cfg,'blockage_percent',0):g}"); self.heatsink_enabled_var.set(getattr(cfg,'heatsink_enabled',False)); self.heatsink_mode_var.set("Geometry builder" if getattr(cfg,'heatsink_geometry_enabled',False) else "Simple extra area"); self.heatsink_area_var.set(f"{getattr(cfg,'heatsink_extra_area_cm2',0):g}"); self.heatsink_eff_var.set(f"{getattr(cfg,'heatsink_efficiency_percent',70):g}"); self.heatsink_hmul_var.set(f"{getattr(cfg,'heatsink_h_multiplier',1):g}"); self.heatsink_fin_orientation_var.set("Fins run along X, spread across Y" if getattr(cfg,'heatsink_fin_orientation','run_y')=='run_x' else "Fins run along Y, spread across X"); self.heatsink_fin_count_var.set(f"{getattr(cfg,'heatsink_fin_count',0):g}"); self.heatsink_fin_thickness_var.set("same" if getattr(cfg,'heatsink_fin_thickness_mm',0)<=0 else f"{getattr(cfg,'heatsink_fin_thickness_mm',0):g}"); self.heatsink_fin_height_var.set(f"{getattr(cfg,'heatsink_fin_default_height_mm',30):g}"); self.heatsink_fin_run_length_var.set("full" if getattr(cfg,'heatsink_fin_run_length_cm',0)<=0 else f"{getattr(cfg,'heatsink_fin_run_length_cm',0):g}"); self.heatsink_fin_positions_var.set(getattr(cfg,'heatsink_fin_positions_cm','even')); self.heatsink_fin_heights_var.set(getattr(cfg,'heatsink_fin_heights_mm','same')); self.heatsink_fin_segments_var.set("auto" if getattr(cfg,'heatsink_fin_segments',0)<=0 else f"{getattr(cfg,'heatsink_fin_segments',0):g}"); self.resistors=list(cfg.resistors); self._refresh_resistor_tree(); self._update_material_fields(); self._update_h_label(); self._update_heatsink_label(); self._draw_layout_preview()
     def _current_snapshot(self):
         if self.result is None: return None
         idx=int(round(float(self.time_slider.get()))); return self.result.snapshots[idx] if 0<=idx<len(self.result.snapshots) else None
@@ -1051,72 +1064,182 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
         poly = Poly3DCollection(self._box_faces_3d(cx, cy, cz, sx, sy, sz), facecolors=color, edgecolors=("k" if edge else color), linewidths=0.35, alpha=alpha)
         ax.add_collection3d(poly)
 
+    def _add_box_edges_3d(self, ax, cx, cy, cz, sx, sy, sz, color="k", linewidth=0.9):
+        """Add wire edges for a 3D box.
+
+        Matplotlib's mplot3d can depth-sort filled polygons poorly. Drawing
+        resistor outlines after solids makes them readable from more angles.
+        """
+        faces = self._box_faces_3d(cx, cy, cz, sx, sy, sz)
+        edges = set()
+        for face in faces:
+            for i in range(len(face)):
+                a = face[i]
+                b = face[(i + 1) % len(face)]
+                edges.add(tuple(sorted((a, b))))
+        for a, b in edges:
+            ax.plot([a[0], b[0]], [a[1], b[1]], [a[2], b[2]], color=color, linewidth=linewidth)
+
     def _open_3d_viewer(self):
         win = tk.Toplevel(self)
         win.title("3D heatmap viewer")
-        win.geometry("1050x780")
+        win.geometry("1100x820")
         win.transient(self)
-        controls = ttk.Frame(win, padding=8); controls.pack(side="top", fill="x")
-        show_fins = tk.BooleanVar(value=True); show_res = tk.BooleanVar(value=True); heat_both = tk.BooleanVar(value=False)
-        side_var = tk.StringVar(value=self.resistor_side_var.get()); view_var = tk.StringVar(value="Isometric")
+
+        controls = ttk.Frame(win, padding=8)
+        controls.pack(side="top", fill="x")
+
+        show_fins = tk.BooleanVar(value=True)
+        show_res = tk.BooleanVar(value=True)
+        show_res_edges = tk.BooleanVar(value=True)
+        transparent_plate = tk.BooleanVar(value=True)
+        exploded_view = tk.BooleanVar(value=True)
+        heat_both = tk.BooleanVar(value=False)
+
+        side_var = tk.StringVar(value=self.resistor_side_var.get())
+        view_var = tk.StringVar(value="Isometric")
         snap_var = tk.IntVar(value=int(round(float(self.time_slider.get()))) if self.result is not None else 0)
+
         ttk.Checkbutton(controls, text="Show fins", variable=show_fins).pack(side="left", padx=(0,8))
         ttk.Checkbutton(controls, text="Show resistors", variable=show_res).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Resistor outlines", variable=show_res_edges).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Transparent plate", variable=transparent_plate).pack(side="left", padx=(0,8))
+        ttk.Checkbutton(controls, text="Exploded view", variable=exploded_view).pack(side="left", padx=(0,8))
         ttk.Checkbutton(controls, text="Heatmap both faces", variable=heat_both).pack(side="left", padx=(0,8))
+
         ttk.Label(controls, text="Resistors").pack(side="left")
         ttk.Combobox(controls, textvariable=side_var, values=["Front / flat side","Back / fin side","Both sides"], state="readonly", width=16).pack(side="left", padx=(4,8))
         ttk.Label(controls, text="View").pack(side="left")
         ttk.Combobox(controls, textvariable=view_var, values=["Isometric","Front","Back","Side X","Side Y"], state="readonly", width=10).pack(side="left", padx=(4,8))
+
         max_snap = len(self.result.snapshots)-1 if self.result is not None else 0
-        slider = ttk.Scale(controls, from_=0, to=max_snap, orient="horizontal", variable=snap_var); slider.pack(side="left", fill="x", expand=True, padx=(8,4))
-        label_var = tk.StringVar(value=""); ttk.Label(controls, textvariable=label_var, width=22).pack(side="left")
-        fig = Figure(figsize=(9,7), dpi=100); canvas = FigureCanvasTkAgg(fig, master=win); canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-        tb = NavigationToolbar2Tk(canvas, win); tb.update()
+        slider = ttk.Scale(controls, from_=0, to=max_snap, orient="horizontal", variable=snap_var)
+        slider.pack(side="left", fill="x", expand=True, padx=(8,4))
+
+        label_var = tk.StringVar(value="")
+        ttk.Label(controls, textvariable=label_var, width=30).pack(side="left")
+
+        fig = Figure(figsize=(9,7), dpi=100)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        tb = NavigationToolbar2Tk(canvas, win)
+        tb.update()
+
         def draw(*_):
             try:
                 cfg, x_cm, y_cm, temp, label = self._current_3d_snapshot_data()
                 if self.result is not None:
                     idx = max(0, min(len(self.result.snapshots)-1, int(round(float(snap_var.get())))))
-                    snap = self.result.snapshots[idx]; cfg = self.result.cfg; x_cm = self.result.x_m*100.0; y_cm = self.result.y_m*100.0; temp = snap.temp_c; label = snap.label
-                fig.clear(); ax3 = fig.add_subplot(111, projection="3d")
-                X,Y = np.meshgrid(x_cm, y_cm, indexing="ij")
+                    snap = self.result.snapshots[idx]
+                    cfg = self.result.cfg
+                    x_cm = self.result.x_m*100.0
+                    y_cm = self.result.y_m*100.0
+                    temp = snap.temp_c
+                    label = snap.label
+
+                fig.clear()
+                ax3 = fig.add_subplot(111, projection="3d")
+                X, Y = np.meshgrid(x_cm, y_cm, indexing="ij")
+
                 t_cm = max(0.02, cfg.plate_thickness_mm/10.0)
-                norm = Normalize(vmin=float(np.min(temp)), vmax=float(np.max(temp)) if float(np.max(temp))>float(np.min(temp)) else float(np.min(temp))+1)
+                vmin = float(np.min(temp))
+                vmax = float(np.max(temp))
+                if vmax <= vmin:
+                    vmax = vmin + 1.0
+                norm = Normalize(vmin=vmin, vmax=vmax)
+
+                plate_alpha = 0.48 if transparent_plate.get() else 1.0
                 colors = cm.inferno(norm(temp))
-                ax3.plot_surface(X,Y,np.zeros_like(X),facecolors=colors,shade=False,linewidth=0,antialiased=False)
-                if heat_both.get(): ax3.plot_surface(X,Y,np.full_like(X,-t_cm),facecolors=colors,shade=False,linewidth=0,antialiased=False,alpha=0.85)
+                colors[..., 3] = plate_alpha
+
+                ax3.plot_surface(X, Y, np.zeros_like(X), facecolors=colors, shade=False, linewidth=0, antialiased=False, alpha=plate_alpha)
+
+                if heat_both.get() or transparent_plate.get():
+                    back_colors = colors.copy()
+                    back_colors[..., 3] = 0.38 if transparent_plate.get() else 0.85
+                    ax3.plot_surface(X, Y, np.full_like(X, -t_cm), facecolors=back_colors, shade=False, linewidth=0, antialiased=False, alpha=float(back_colors[..., 3].mean()))
+
+                # v12: draw fin thermal segments, not whole fins.
                 if show_fins.get():
-                    for fin in heatsink_fin_specs(cfg):
-                        fx,fy=fin["center_x_cm"],fin["center_y_cm"]; fw=max(0.02,fin["footprint_x_cm"]); fr=max(0.02,fin["footprint_y_cm"]); fh=max(0.02,fin["height_mm"]/10.0)
-                        tc=self._temp_nearest_3d(fx,fy,x_cm,y_cm,temp)
-                        self._add_box_3d(ax3,fx,fy,-t_cm-fh/2.0,fw,fr,fh,cm.inferno(norm(tc)),alpha=0.60)
+                    for fin in heatsink_fin_segment_specs(cfg):
+                        fx = fin["center_x_cm"]
+                        fy = fin["center_y_cm"]
+                        fw = max(0.02, fin["footprint_x_cm"])
+                        fr = max(0.02, fin["footprint_y_cm"])
+                        fh = max(0.02, fin["height_mm"]/10.0)
+                        tc = self._temp_nearest_3d(fx, fy, x_cm, y_cm, temp)
+                        self._add_box_3d(ax3, fx, fy, -t_cm - fh/2.0, fw, fr, fh, cm.inferno(norm(tc)), alpha=0.72)
+
+                resistor_edge_boxes = []
                 if show_res.get():
-                    z_sides=[]; side=side_var.get()
-                    if side in ("Front / flat side","Both sides"): z_sides.append((0.28,1))
-                    if side in ("Back / fin side","Both sides"): z_sides.append((-t_cm-0.28,-1))
+                    z_sides = []
+                    side = side_var.get()
+                    explode_gap = 0.72 if exploded_view.get() else 0.0
+                    if side in ("Front / flat side","Both sides"):
+                        z_sides.append((0.28 + explode_gap, 1))
+                    if side in ("Back / fin side","Both sides"):
+                        z_sides.append((-t_cm - 0.28 - explode_gap, -1))
+
                     for r in cfg.resistors:
-                        sx=max(0.03,r.length_mm/10.0); sy=max(0.03,r.width_mm/10.0); sz=0.55; tc=self._temp_nearest_3d(r.center_x_cm,r.center_y_cm,x_cm,y_cm,temp)
-                        for zc,sign in z_sides:
-                            self._add_box_3d(ax3,r.center_x_cm,r.center_y_cm,zc,sx,sy,sz,cm.inferno(norm(tc)),alpha=0.88)
-                            ax3.text(r.center_x_cm,r.center_y_cm,zc+sign*0.35,r.name,ha="center",va="center",fontsize=8)
-                mappable=cm.ScalarMappable(norm=norm,cmap=cm.inferno); mappable.set_array(temp); fig.colorbar(mappable,ax=ax3,shrink=0.70,pad=0.02,label="Temperature, °C")
-                maxx=max(abs(float(x_cm[0])),abs(float(x_cm[-1])),1.0); maxy=max(abs(float(y_cm[0])),abs(float(y_cm[-1])),1.0)
-                zmin=-t_cm-max([fin.get("height_mm",0)/10.0 for fin in heatsink_fin_specs(cfg)]+[1.0])-0.8; zmax=1.2
-                ax3.set_xlim(-maxx,maxx); ax3.set_ylim(-maxy,maxy); ax3.set_zlim(zmin,zmax)
-                ax3.set_xlabel("x / width cm"); ax3.set_ylabel("y / height cm"); ax3.set_zlabel("z cm"); ax3.set_title(f"3D heatmap: {label}")
-                try: ax3.set_box_aspect((2*maxx,2*maxy,max(1.0,zmax-zmin)))
-                except Exception: pass
-                view=view_var.get()
-                if view=="Front": ax3.view_init(elev=80,azim=-90)
-                elif view=="Back": ax3.view_init(elev=-75,azim=-90)
-                elif view=="Side X": ax3.view_init(elev=12,azim=0)
-                elif view=="Side Y": ax3.view_init(elev=12,azim=90)
-                else: ax3.view_init(elev=28,azim=-55)
-                label_var.set(label); fig.subplots_adjust(left=0.02,right=0.90,bottom=0.02,top=0.94); canvas.draw_idle()
+                        sx = max(0.03, r.length_mm/10.0)
+                        sy = max(0.03, r.width_mm/10.0)
+                        sz = 0.55
+                        tc = self._temp_nearest_3d(r.center_x_cm, r.center_y_cm, x_cm, y_cm, temp)
+                        col = cm.inferno(norm(tc))
+                        for zc, sign in z_sides:
+                            self._add_box_3d(ax3, r.center_x_cm, r.center_y_cm, zc, sx, sy, sz, col, alpha=0.96)
+                            resistor_edge_boxes.append((r.center_x_cm, r.center_y_cm, zc, sx, sy, sz))
+                            ax3.text(r.center_x_cm, r.center_y_cm, zc + sign*0.45, r.name, ha="center", va="center", fontsize=8, color="black")
+
+                if show_res.get() and show_res_edges.get():
+                    for args in resistor_edge_boxes:
+                        self._add_box_edges_3d(ax3, *args, color="black", linewidth=0.95)
+
+                mappable = cm.ScalarMappable(norm=norm, cmap=cm.inferno)
+                mappable.set_array(temp)
+                fig.colorbar(mappable, ax=ax3, shrink=0.70, pad=0.02, label="Temperature, °C")
+
+                maxx = max(abs(float(x_cm[0])), abs(float(x_cm[-1])), 1.0)
+                maxy = max(abs(float(y_cm[0])), abs(float(y_cm[-1])), 1.0)
+                max_fin_h = max([fin.get("height_mm",0)/10.0 for fin in heatsink_fin_specs(cfg)] + [1.0])
+                extra = 0.9 if exploded_view.get() else 0.2
+                zmin = -t_cm - max_fin_h - extra - 0.8
+                zmax = 1.2 + extra
+
+                ax3.set_xlim(-maxx, maxx)
+                ax3.set_ylim(-maxy, maxy)
+                ax3.set_zlim(zmin, zmax)
+                ax3.set_xlabel("x / width cm")
+                ax3.set_ylabel("y / height cm")
+                ax3.set_zlabel("z cm")
+                ax3.set_title(f"3D heatmap: {label}")
+                try:
+                    ax3.set_box_aspect((2*maxx,2*maxy,max(1.0,zmax-zmin)))
+                except Exception:
+                    pass
+
+                view = view_var.get()
+                if view=="Front":
+                    ax3.view_init(elev=80,azim=-90)
+                elif view=="Back":
+                    ax3.view_init(elev=-75,azim=-90)
+                elif view=="Side X":
+                    ax3.view_init(elev=12,azim=0)
+                elif view=="Side Y":
+                    ax3.view_init(elev=12,azim=90)
+                else:
+                    ax3.view_init(elev=28,azim=-55)
+
+                label_var.set(f"{label} | fin segs: {len(heatsink_fin_segment_specs(cfg))}")
+                fig.subplots_adjust(left=0.02,right=0.90,bottom=0.02,top=0.94)
+                canvas.draw_idle()
             except Exception as e:
                 label_var.set(f"3D error: {e}")
-        for var in (show_fins,show_res,heat_both,side_var,view_var): var.trace_add("write",lambda *a:draw())
-        slider.configure(command=lambda v:draw()); draw()
+
+        for var in (show_fins, show_res, show_res_edges, heat_both, transparent_plate, exploded_view, side_var, view_var):
+            var.trace_add("write", lambda *a: draw())
+        slider.configure(command=lambda v: draw())
+        draw()
 
     def _fin_count_int(self):
         return max(0, int(round(parse_float(self.heatsink_fin_count_var.get(), "Fin count", 0))))
