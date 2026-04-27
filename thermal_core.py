@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v12_gui.py
+thermal_plate_sim_v14_gui.py
 
 Desktop GUI for simulating passive heat spreading in a flat metal plate.
 
@@ -40,7 +40,7 @@ Install:
   python3 -m pip install numpy matplotlib
 
 Run:
-  python3 thermal_plate_sim_v12_gui.py
+  python3 thermal_plate_sim_v14_gui.py
 """
 
 from __future__ import annotations
@@ -144,6 +144,12 @@ class PlateConfig:
     heatsink_fin_positions_cm: str = "even"  # "even" or comma-separated centers
     heatsink_fin_heights_mm: str = "same"    # "same" or comma-separated heights
     heatsink_fin_segments: int = 0            # 0 = auto; split each fin along its run length for local cooling resolution
+
+    # Resistor thermal model.
+    # The solver calculates plate/contact temperature. These values estimate
+    # the resistor case/body and internal element above the local plate contact.
+    resistor_case_to_plate_cw: float = 0.5
+    resistor_element_to_case_cw: float = 0.6
 
 
 @dataclass
@@ -381,6 +387,72 @@ def fin_efficiency_for_spec(cfg: "PlateConfig", spec: Dict) -> float:
         return 1.0
     return max(0.0, min(1.0, math.tanh(ml) / ml))
 
+
+
+def fin_temperature_at_height(cfg: "PlateConfig", spec: Dict, base_temp_c: float, height_fraction: float) -> float:
+    """Estimate fin temperature at a height fraction from base to tip.
+
+    height_fraction:
+        0.0 = attached base of fin
+        1.0 = fin tip
+
+    This uses the same straight rectangular fin theory used for fin efficiency.
+    It is not full CFD, but it gives a physically meaningful gradient up the fin
+    instead of coloring the whole fin as one temperature.
+    """
+    frac = max(0.0, min(1.0, float(height_fraction)))
+    ambient = float(getattr(cfg, "ambient_c", 25.0))
+    theta_b = float(base_temp_c) - ambient
+    if abs(theta_b) < 1e-12:
+        return float(base_temp_c)
+
+    h = max(0.05, float(cfg.convection_h_w_m2k))
+    k = max(0.1, float(cfg.thermal_conductivity_w_mk))
+    run_m = max(1e-9, spec["run_length_cm"] / 100.0)
+    thick_m = max(1e-9, spec["thickness_mm"] / 1000.0)
+    height_m = max(1e-9, spec["height_mm"] / 1000.0)
+
+    area_c = thick_m * run_m
+    perimeter = 2.0 * (run_m + thick_m)
+    m = math.sqrt(h * perimeter / (k * area_c))
+
+    # Corrected length approximates convection from the fin tip.
+    corrected_length = height_m + thick_m / 2.0
+    x = frac * height_m
+
+    denom = math.cosh(m * corrected_length)
+    if denom <= 1e-12:
+        return float(base_temp_c)
+
+    ratio = math.cosh(m * max(0.0, corrected_length - x)) / denom
+    return ambient + theta_b * ratio
+
+
+def resistor_temperature_estimate(cfg: "PlateConfig", r: Resistor, temp_c: np.ndarray, mask: np.ndarray, covered_area_m2: float) -> Dict:
+    """Estimate plate footprint, resistor case/body, and element temperatures."""
+    plate_avg = float(np.mean(temp_c[mask]))
+    plate_max = float(np.max(temp_c[mask]))
+    case_to_plate = max(0.0, float(getattr(cfg, "resistor_case_to_plate_cw", 0.5)))
+    element_to_case = max(0.0, float(getattr(cfg, "resistor_element_to_case_cw", 0.6)))
+
+    case_avg = plate_avg + r.power_w * case_to_plate
+    case_max = plate_max + r.power_w * case_to_plate
+    element_avg = case_avg + r.power_w * element_to_case
+    element_max = case_max + r.power_w * element_to_case
+
+    return {
+        "name": r.name,
+        "power_w": float(r.power_w),
+        "covered_area_cm2": covered_area_m2 * 10000.0,
+        "plate_footprint_avg_temp_c": plate_avg,
+        "plate_footprint_max_temp_c": plate_max,
+        "resistor_case_to_plate_cw": case_to_plate,
+        "resistor_element_to_case_cw": element_to_case,
+        "estimated_case_avg_temp_c": case_avg,
+        "estimated_case_max_temp_c": case_max,
+        "estimated_element_avg_temp_c": element_avg,
+        "estimated_element_max_temp_c": element_max,
+    }
 
 def _auto_fin_segment_count(cfg: "PlateConfig", spec: Dict, dx_m=None, dy_m=None) -> int:
     """Choose a sensible number of local thermal segments for one fin."""
@@ -1013,21 +1085,38 @@ def calculate_summary(
         }
 
         for r, mask, covered_area_m2 in resistor_masks:
-            row[f"{r.name}_avg_temp_c"] = float(np.mean(temp[mask]))
-            row[f"{r.name}_max_temp_c"] = float(np.max(temp[mask]))
+            est = resistor_temperature_estimate(cfg, r, temp, mask, covered_area_m2)
+            row[f"{r.name}_avg_temp_c"] = est["plate_footprint_avg_temp_c"]
+            row[f"{r.name}_max_temp_c"] = est["plate_footprint_max_temp_c"]
+            row[f"{r.name}_case_max_temp_c"] = est["estimated_case_max_temp_c"]
+            row[f"{r.name}_element_max_temp_c"] = est["estimated_element_max_temp_c"]
 
         snap_rows.append(row)
 
     resistor_reports = []
     final_snap = snapshots[-1]
+    final_temp = final_snap.temp_c
     for r, mask, covered_area_m2 in resistor_masks:
-        resistor_reports.append({
-            "name": r.name,
-            "power_w": r.power_w,
-            "covered_area_cm2": covered_area_m2 * 10000.0,
-            "final_avg_temp_c": float(np.mean(final_snap.temp_c[mask])),
-            "final_max_temp_c": float(np.max(final_snap.temp_c[mask])),
-        })
+        resistor_reports.append(resistor_temperature_estimate(cfg, r, final_temp, mask, covered_area_m2))
+
+    hot_idx = np.unravel_index(np.argmax(final_temp), final_temp.shape)
+    hottest_plate_point = {
+        "x_cm": float(x_m[hot_idx[0]] * 100.0),
+        "y_cm": float(y_m[hot_idx[1]] * 100.0),
+        "temp_c": float(final_temp[hot_idx]),
+    }
+
+    precision_notes = []
+    min_res_dim_mm = min([min(r.length_mm, r.width_mm) for r in cfg.resistors], default=999.0)
+    if cfg.grid_mm > max(0.1, min_res_dim_mm / 2.0):
+        precision_notes.append(
+            "Grid size is large compared with the smallest resistor footprint. "
+            "Use a smaller grid for better hotspot/contact resolution."
+        )
+    if getattr(cfg, "heatsink_geometry_enabled", False) and getattr(cfg, "heatsink_fin_count", 0) > 0:
+        seg_count = heatsink_geometry_summary(cfg).get("thermal_segment_count", 0)
+        if seg_count < max(1, getattr(cfg, "heatsink_fin_count", 0)):
+            precision_notes.append("Fin thermal segmentation is very low. Use auto or increase thermal segments.")
 
     return {
         "total_power_w": total_power_w,
@@ -1044,6 +1133,10 @@ def calculate_summary(
         "heatsink_raw_extra_area_cm2": getattr(cfg, "heatsink_extra_area_cm2", 0.0),
         "heatsink_effective_extra_area_cm2": heatsink_effective_extra_area_cm2(cfg),
         "heatsink_geometry": heatsink_geometry_summary(cfg),
+        "resistor_case_to_plate_cw": float(getattr(cfg, "resistor_case_to_plate_cw", 0.5)),
+        "resistor_element_to_case_cw": float(getattr(cfg, "resistor_element_to_case_cw", 0.6)),
+        "hottest_plate_point": hottest_plate_point,
+        "precision_notes": precision_notes,
         "thermal_conductance_w_per_k": thermal_conductance_w_k,
         "simple_average_final_rise_c": simple_average_final_rise_c,
         "tau_s": tau_s,

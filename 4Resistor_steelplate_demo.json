@@ -1,0 +1,83 @@
+{
+  "plate_length_cm": 51.0,
+  "plate_width_cm": 41.0,
+  "plate_thickness_mm": 2.0,
+  "material_name": "steel",
+  "thermal_conductivity_w_mk": 45.0,
+  "density_kg_m3": 7850.0,
+  "heat_capacity_j_kgk": 470.0,
+  "ambient_c": 25.0,
+  "convection_h_w_m2k": 7.0,
+  "grid_mm": 5.0,
+  "resistors": [
+    {
+      "name": "R1",
+      "power_w": 50.0,
+      "center_x_cm": -13.0,
+      "center_y_cm": 10.0,
+      "length_mm": 50.0,
+      "width_mm": 20.0
+    },
+    {
+      "name": "R2",
+      "power_w": 50.0,
+      "center_x_cm": -13.0,
+      "center_y_cm": -10.0,
+      "length_mm": 50.0,
+      "width_mm": 20.0
+    },
+    {
+      "name": "R3",
+      "power_w": 50.0,
+      "center_x_cm": 13.0,
+      "center_y_cm": 10.0,
+      "length_mm": 50.0,
+      "width_mm": 20.0
+    },
+    {
+      "name": "R4",
+      "power_w": 50.0,
+      "center_x_cm": 13.0,
+      "center_y_cm": -10.0,
+      "length_mm": 50.0,
+      "width_mm": 20.0
+    }
+  ],
+  "initial_plate_temp_c": 25.0,
+  "max_time_s": 7200.0,
+  "snapshot_every_s": 120.0,
+  "include_steady_state": true,
+  "advanced_cooling_enabled": false,
+  "orientation": "vertical",
+  "environment": "open_air",
+  "wall_clearance_cm": 20.0,
+  "surface_finish": "bare_metal",
+  "air_movement": "still_air",
+  "hot_air_path": "free_rise",
+  "blockage_percent": 0.0,
+  "cooling_notes": "manual h",
+  "heatsink_enabled": false,
+  "heatsink_extra_area_cm2": 0.0,
+  "heatsink_efficiency_percent": 70.0,
+  "heatsink_h_multiplier": 1.0,
+  "heatsink_notes": "No heatsink / extra fins",
+  "heatsink_geometry_enabled": true,
+  "heatsink_fin_orientation": "run_y",
+  "heatsink_fin_count": 16,
+  "heatsink_fin_thickness_mm": 0.0,
+  "heatsink_fin_default_height_mm": 30.0,
+  "heatsink_fin_run_length_cm": 0.0,
+  "heatsink_fin_positions_cm": "even",
+  "heatsink_fin_heights_mm": "same",
+  "heatsink_fin_segments": 0,
+  "resistor_case_to_plate_cw": 0.5,
+  "resistor_element_to_case_cw": 0.6,
+  "ui_safety": {
+    "max_plate": "90",
+    "max_case": "120",
+    "max_element": "200",
+    "extra_cw": "0.5",
+    "element_cw": "0.6",
+    "margin": "25"
+  }
+}

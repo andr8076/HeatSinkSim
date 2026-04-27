@@ -13,7 +13,7 @@ import subprocess
 import sys
 import traceback
 
-APP_FILE = "thermal_plate_sim_v13_gui.py"
+APP_FILE = "thermal_plate_sim_v14_gui.py"
 REQUIRED = ["numpy", "matplotlib"]
 
 
@@ -68,8 +68,8 @@ def main() -> int:
             return 1
 
     try:
-        import thermal_plate_sim_v13_gui
-        thermal_plate_sim_v13_gui.main()
+        import thermal_plate_sim_v14_gui
+        thermal_plate_sim_v14_gui.main()
         return 0
     except Exception:
         print("The simulator crashed during startup:")

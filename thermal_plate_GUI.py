@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-thermal_plate_sim_v13_gui.py
+thermal_plate_sim_v14_gui.py
 
 Cross-platform thermal plate simulator with segmented fin transfer, improved 3D viewer, and multi-worker optimization.
 Run this file from the same folder as thermal_core.py.
@@ -9,7 +9,7 @@ Install dependencies:
     python -m pip install numpy matplotlib
 
 Run:
-    python thermal_plate_sim_v13_gui.py
+    python thermal_plate_sim_v14_gui.py
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ from thermal_core import (
     estimate_passive_h,
     evenly_spaced_positions,
     fin_efficiency_for_spec,
+    fin_temperature_at_height,
     format_time,
     heatsink_fin_specs,
     heatsink_fin_segment_specs,
@@ -76,7 +77,7 @@ from thermal_core import (
 class ThermalPlateGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Thermal Plate Simulator v13")
+        self.title("Thermal Plate Simulator v14")
 
         # Cross-platform initial window sizing.
         # macOS laptops and smaller Linux/Windows screens can be shorter than
@@ -170,8 +171,8 @@ class ThermalPlateGUI(tk.Tk):
             help_menu.add_command(
                 label="About",
                 command=lambda: messagebox.showinfo(
-                    "Thermal Plate Simulator v13",
-                    "Thermal Plate Simulator v13\nCross-platform GUI for Windows, macOS, and Linux."
+                    "Thermal Plate Simulator v14",
+                    "Thermal Plate Simulator v14\nCross-platform GUI for Windows, macOS, and Linux."
                 )
             )
             menubar.add_cascade(label="Help", menu=help_menu)
@@ -203,7 +204,9 @@ class ThermalPlateGUI(tk.Tk):
 
         self.max_plate_temp_var = tk.StringVar(value="90")
         self.max_res_case_temp_var = tk.StringVar(value="120")
+        self.max_res_element_temp_var = tk.StringVar(value="200")
         self.extra_cw_var = tk.StringVar(value="0.5")
+        self.element_cw_var = tk.StringVar(value="0.6")
         self.cooling_margin_var = tk.StringVar(value="25")
 
         self.advanced_cooling_var = tk.BooleanVar(value=False)
@@ -391,9 +394,11 @@ class ThermalPlateGUI(tk.Tk):
         safety.grid(row=row, column=0, sticky="ew", pady=(0,8)); row += 1
         self._entry_row(safety, 0, "Max plate °C", self.max_plate_temp_var)
         self._entry_row(safety, 1, "Max resistor case °C", self.max_res_case_temp_var)
-        self._entry_row(safety, 2, "Extra resistor→plate °C/W", self.extra_cw_var)
-        self._entry_row(safety, 3, "Cooling margin %", self.cooling_margin_var)
-        self._note(safety, 4, "Limits classify the result. Extra °C/W estimates resistor case hotter than plate.")
+        self._entry_row(safety, 2, "Max element °C", self.max_res_element_temp_var)
+        self._entry_row(safety, 3, "Case→plate °C/W", self.extra_cw_var)
+        self._entry_row(safety, 4, "Element→case °C/W", self.element_cw_var)
+        self._entry_row(safety, 5, "Cooling margin %", self.cooling_margin_var)
+        self._note(safety, 6, "Optional. Use datasheet °C/W values when available. Otherwise defaults are placeholders.")
 
         run = ttk.LabelFrame(parent, text="Run", padding=8)
         run.grid(row=row, column=0, sticky="ew", pady=(0,8)); row += 1
@@ -514,7 +519,10 @@ Always run the full simulation after optimizing.
 Open 3D viewer after a simulation to see the heatmapped plate, back-side fins, and resistor blocks. v12 adds transparent/exploded viewing and resistor outlines, so backside resistors are much easier to see from awkward angles. The resistor side control is visual; the 2D thermal model is still through the same thin plate.
 
 Fin layout and fin heat transfer
-Use the heatsink dialog's Fin layout designer for individual fin positions and heights. Even fills the available width. Place fins near resistors clusters fins under/near heat sources along the fin spread axis. Thermal segments controls how finely each fin is split along its length for local heat-transfer calculation. Use auto unless you specifically need more detail.
+Use the heatsink dialog's Fin layout designer for individual fin positions and heights. Even fills the available width. Place fins near resistors clusters fins under/near heat sources along the fin spread axis. Thermal segments controls how finely each fin is split along its length for local heat-transfer calculation. Use auto unless you specifically need more detail. v14 also colors fins with a temperature gradient up their height using the fin equation, instead of coloring the whole fin uniformly.
+
+Resistor body/element temperatures
+The plate solver gives the local plate footprint temperature. v14 adds a resistor thermal stack: plate footprint → case/body → internal element. Enter Case→plate °C/W and Element→case °C/W from a datasheet if possible.
 """.strip())
         t.configure(state="disabled")
 
@@ -681,6 +689,8 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             max_time_s=60.0,
             snapshot_every_s=60.0,
             include_steady_state=False,
+            resistor_case_to_plate_cw=self._f(self.extra_cw_var.get(), 0.5),
+            resistor_element_to_case_cw=self._f(self.element_cw_var.get(), 0.6),
             heatsink_enabled=bool(self.heatsink_enabled_var.get()),
             heatsink_geometry_enabled=self.heatsink_mode_var.get().startswith("Geometry"),
             heatsink_fin_orientation=self._heatsink_orientation_key(),
@@ -766,6 +776,8 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             max_time_s=parse_time_to_seconds(self.max_time_var.get(),"Max time"),
             snapshot_every_s=parse_time_to_seconds(self.snapshot_every_var.get(),"Snapshot every"),
             include_steady_state=bool(self.include_steady_var.get()),
+            resistor_case_to_plate_cw=parse_float(self.extra_cw_var.get(), "Case→plate °C/W", 0.0),
+            resistor_element_to_case_cw=parse_float(self.element_cw_var.get(), "Element→case °C/W", 0.0),
             advanced_cooling_enabled=bool(self.advanced_cooling_var.get()),
             orientation=key_from_display(ORIENTATION_OPTIONS,self.orientation_var.get()),
             environment=key_from_display(ENVIRONMENT_OPTIONS,self.environment_var.get()),
@@ -951,19 +963,80 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
             )
         return "Geometry fins: off"
     def _write_summary(self,result):
-        s=result.summary; snap=result.snapshots[-1]; temp=snap.temp_c; max_plate=float(np.max(temp)); avg_plate=float(np.mean(temp))
-        max_lim=self._f(self.max_plate_temp_var.get(),90); case_lim=self._f(self.max_res_case_temp_var.get(),120); extra=self._f(self.extra_cw_var.get(),0.5); margin=self._f(self.cooling_margin_var.get(),25)
-        safe_h=result.cfg.convection_h_w_m2k*(1-max(0,min(90,margin))/100); conservative=result.cfg.ambient_c+s['total_power_w']/(max(.1,safe_h)*(s['plate_area_both_faces_cm2']/10000))
-        lines=["Simulation complete.","",f"Grid: {s['grid_cells_x']} × {s['grid_cells_y']}",f"Total heat: {s['total_power_w']:.2f} W",f"Plate area both faces: {s['plate_area_both_faces_cm2']:.0f} cm²",f"Base h: {s.get('base_h_w_m2k',result.cfg.convection_h_w_m2k):.2f} W/m²K",f"Effective h used: {s.get('effective_convection_h_w_m2k',result.cfg.convection_h_w_m2k):.2f} W/m²K",f"Heatsink effective extra area: {s.get('heatsink_effective_extra_area_cm2',0):.0f} cm²",self._heatsink_summary_line(s),f"Final endpoint: {snap.label}",f"Average plate temp: {avg_plate:.1f} °C",f"Max plate temp: {max_plate:.1f} °C","","Pass/fail:"]
-        lines.append(f"  Plate: {'PASS' if max_plate<=max_lim else 'WARNING' if max_plate<=max_lim+15 else 'FAIL'} ({max_plate:.1f} °C vs limit {max_lim:.1f} °C)")
-        lines.append(f"  Conservative average with {margin:.0f}% h margin: {conservative:.1f} °C")
-        lines.append(""); lines.append("Resistor footprint / estimated case:")
-        for r,mask,area in result.resistor_masks:
-            foot_avg=float(np.mean(temp[mask])); foot_max=float(np.max(temp[mask])); est_case=foot_avg+r.power_w*extra
-            status='PASS' if est_case<=case_lim else 'WARNING' if est_case<=case_lim+15 else 'FAIL'
-            lines.append(f"  {r.name}: footprint avg {foot_avg:.1f} °C, max {foot_max:.1f} °C")
-            lines.append(f"      estimated case {est_case:.1f} °C using {extra:g} °C/W: {status}")
-        lines += ["","Warm-up rough average:",f"  Time constant: {format_time(s['tau_s'])}",f"  ~90% final average: {format_time(s['t90_s'])}",f"  ~95% final average: {format_time(s['t95_s'])}","","Model limit: real airflow, mounting pressure, and resistor internals must still be measured."]
+        s = result.summary
+        snap = result.snapshots[-1]
+        temp = snap.temp_c
+        max_plate = float(np.max(temp))
+        avg_plate = float(np.mean(temp))
+
+        max_lim = self._f(self.max_plate_temp_var.get(), 90)
+        case_lim = self._f(self.max_res_case_temp_var.get(), 120)
+        element_lim = self._f(self.max_res_element_temp_var.get(), 200)
+        margin = self._f(self.cooling_margin_var.get(), 25)
+
+        safe_h = result.cfg.convection_h_w_m2k * (1 - max(0, min(90, margin)) / 100)
+        conservative = result.cfg.ambient_c + s['total_power_w'] / (
+            max(.1, safe_h) * (s['plate_area_both_faces_cm2'] / 10000)
+        )
+
+        hot = s.get("hottest_plate_point", {})
+        lines = [
+            "Simulation complete.",
+            "",
+            f"Grid: {s['grid_cells_x']} × {s['grid_cells_y']}",
+            f"Total heat: {s['total_power_w']:.2f} W",
+            f"Plate area both faces: {s['plate_area_both_faces_cm2']:.0f} cm²",
+            f"Base h: {s.get('base_h_w_m2k', result.cfg.convection_h_w_m2k):.2f} W/m²K",
+            f"Effective h used: {s.get('effective_convection_h_w_m2k', result.cfg.convection_h_w_m2k):.2f} W/m²K",
+            f"Heatsink effective extra area: {s.get('heatsink_effective_extra_area_cm2', 0):.0f} cm²",
+            self._heatsink_summary_line(s),
+            f"Final endpoint: {snap.label}",
+            f"Average plate temp: {avg_plate:.1f} °C",
+            f"Max plate temp: {max_plate:.1f} °C",
+        ]
+
+        if hot:
+            lines.append(f"Hottest plate point: x={hot.get('x_cm',0):.1f} cm, y={hot.get('y_cm',0):.1f} cm")
+
+        lines += [
+            "",
+            "Pass/fail:",
+            f"  Plate: {'PASS' if max_plate <= max_lim else 'WARNING' if max_plate <= max_lim + 15 else 'FAIL'} ({max_plate:.1f} °C vs limit {max_lim:.1f} °C)",
+            f"  Conservative average with {margin:.0f}% h margin: {conservative:.1f} °C",
+            "",
+            "Resistor temperature stack:",
+            f"  Case→plate: {s.get('resistor_case_to_plate_cw', result.cfg.resistor_case_to_plate_cw):g} °C/W",
+            f"  Element→case: {s.get('resistor_element_to_case_cw', result.cfg.resistor_element_to_case_cw):g} °C/W",
+        ]
+
+        for rr in s.get("resistors", []):
+            case_max = rr.get("estimated_case_max_temp_c", rr.get("final_max_temp_c", 0))
+            elem_max = rr.get("estimated_element_max_temp_c", case_max)
+            case_status = 'PASS' if case_max <= case_lim else 'WARNING' if case_max <= case_lim + 15 else 'FAIL'
+            elem_status = 'PASS' if elem_max <= element_lim else 'WARNING' if elem_max <= element_lim + 25 else 'FAIL'
+            lines.append(f"  {rr.get('name','R?')}:")
+            lines.append(
+                f"      plate footprint avg {rr.get('plate_footprint_avg_temp_c',0):.1f} °C, "
+                f"max {rr.get('plate_footprint_max_temp_c',0):.1f} °C"
+            )
+            lines.append(f"      estimated case/body max {case_max:.1f} °C: {case_status}")
+            lines.append(f"      estimated internal element max {elem_max:.1f} °C: {elem_status}")
+
+        if s.get("precision_notes"):
+            lines += ["", "Precision notes:"]
+            for note in s["precision_notes"]:
+                lines.append(f"  - {note}")
+
+        lines += [
+            "",
+            "Warm-up rough average:",
+            f"  Time constant: {format_time(s['tau_s'])}",
+            f"  ~90% final average: {format_time(s['t90_s'])}",
+            f"  ~95% final average: {format_time(s['t95_s'])}",
+            "",
+            "Model limit: airflow, mounting pressure, and actual resistor datasheet values should still be verified with measurement.",
+        ]
+
         self._set_status("\n".join(lines))
     def _f(self,t,fb):
         try: return float(str(t).replace(",","."))
@@ -1005,7 +1078,14 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
         except Exception as e: messagebox.showerror("Invalid input",str(e)); return
         path=filedialog.asksaveasfilename(title="Save config",defaultextension=".json",filetypes=[("JSON","*.json"),("All","*.*")])
         if not path: return
-        data=asdict(cfg); data['ui_safety']={'max_plate':self.max_plate_temp_var.get(),'max_case':self.max_res_case_temp_var.get(),'extra_cw':self.extra_cw_var.get(),'margin':self.cooling_margin_var.get()}
+        data=asdict(cfg); data['ui_safety']={
+            'max_plate': self.max_plate_temp_var.get(),
+            'max_case': self.max_res_case_temp_var.get(),
+            'max_element': self.max_res_element_temp_var.get(),
+            'extra_cw': self.extra_cw_var.get(),
+            'element_cw': self.element_cw_var.get(),
+            'margin': self.cooling_margin_var.get()
+        }
         Path(path).write_text(json.dumps(data,indent=2),encoding="utf-8"); self._append_status(f"Saved config: {path}")
     def _load_config(self):
         path=filedialog.askopenfilename(title="Load config",filetypes=[("JSON","*.json"),("All","*.*")])
@@ -1013,11 +1093,16 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
         try:
             data=json.loads(Path(path).read_text(encoding="utf-8")); safety=data.pop('ui_safety',{})
             data['resistors']=[Resistor(**r) for r in data['resistors']]; cfg=PlateConfig(**data); self._apply_config(cfg)
-            self.max_plate_temp_var.set(str(safety.get('max_plate',self.max_plate_temp_var.get()))); self.max_res_case_temp_var.set(str(safety.get('max_case',self.max_res_case_temp_var.get()))); self.extra_cw_var.set(str(safety.get('extra_cw',self.extra_cw_var.get()))); self.cooling_margin_var.set(str(safety.get('margin',self.cooling_margin_var.get())))
+            self.max_plate_temp_var.set(str(safety.get('max_plate', self.max_plate_temp_var.get())))
+            self.max_res_case_temp_var.set(str(safety.get('max_case', self.max_res_case_temp_var.get())))
+            self.max_res_element_temp_var.set(str(safety.get('max_element', self.max_res_element_temp_var.get())))
+            self.extra_cw_var.set(str(safety.get('extra_cw', getattr(cfg, 'resistor_case_to_plate_cw', self.extra_cw_var.get()))))
+            self.element_cw_var.set(str(safety.get('element_cw', getattr(cfg, 'resistor_element_to_case_cw', self.element_cw_var.get()))))
+            self.cooling_margin_var.set(str(safety.get('margin', self.cooling_margin_var.get())))
             self._append_status(f"Loaded config: {path}")
         except Exception as e: messagebox.showerror("Load failed",str(e))
     def _apply_config(self,cfg):
-        self.plate_width_x_var.set(f"{cfg.plate_length_cm:g}"); self.plate_height_y_var.set(f"{cfg.plate_width_cm:g}"); self.plate_thickness_var.set(f"{cfg.plate_thickness_mm:g}"); self.material_var.set(cfg.material_name); self.k_var.set(f"{cfg.thermal_conductivity_w_mk:g}"); self.rho_var.set(f"{cfg.density_kg_m3:g}"); self.cp_var.set(f"{cfg.heat_capacity_j_kgk:g}"); self.ambient_var.set(f"{cfg.ambient_c:g}"); self.h_var.set(f"{cfg.convection_h_w_m2k:g}"); self.grid_var.set(f"{cfg.grid_mm:g}"); self.initial_temp_var.set(f"{cfg.initial_plate_temp_c:g}"); self.max_time_var.set(format_time(cfg.max_time_s).replace(' ','')); self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(' ','')); self.include_steady_var.set(cfg.include_steady_state); self.advanced_cooling_var.set(getattr(cfg,'advanced_cooling_enabled',False)); self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS,getattr(cfg,'orientation','vertical'))); self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS,getattr(cfg,'environment','open_air'))); self.clearance_var.set(f"{getattr(cfg,'wall_clearance_cm',20):g}"); self.surface_var.set(display_from_key(SURFACE_OPTIONS,getattr(cfg,'surface_finish','bare_metal'))); self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS,getattr(cfg,'air_movement','still_air'))); self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS,getattr(cfg,'hot_air_path','free_rise'))); self.blockage_var.set(f"{getattr(cfg,'blockage_percent',0):g}"); self.heatsink_enabled_var.set(getattr(cfg,'heatsink_enabled',False)); self.heatsink_mode_var.set("Geometry builder" if getattr(cfg,'heatsink_geometry_enabled',False) else "Simple extra area"); self.heatsink_area_var.set(f"{getattr(cfg,'heatsink_extra_area_cm2',0):g}"); self.heatsink_eff_var.set(f"{getattr(cfg,'heatsink_efficiency_percent',70):g}"); self.heatsink_hmul_var.set(f"{getattr(cfg,'heatsink_h_multiplier',1):g}"); self.heatsink_fin_orientation_var.set("Fins run along X, spread across Y" if getattr(cfg,'heatsink_fin_orientation','run_y')=='run_x' else "Fins run along Y, spread across X"); self.heatsink_fin_count_var.set(f"{getattr(cfg,'heatsink_fin_count',0):g}"); self.heatsink_fin_thickness_var.set("same" if getattr(cfg,'heatsink_fin_thickness_mm',0)<=0 else f"{getattr(cfg,'heatsink_fin_thickness_mm',0):g}"); self.heatsink_fin_height_var.set(f"{getattr(cfg,'heatsink_fin_default_height_mm',30):g}"); self.heatsink_fin_run_length_var.set("full" if getattr(cfg,'heatsink_fin_run_length_cm',0)<=0 else f"{getattr(cfg,'heatsink_fin_run_length_cm',0):g}"); self.heatsink_fin_positions_var.set(getattr(cfg,'heatsink_fin_positions_cm','even')); self.heatsink_fin_heights_var.set(getattr(cfg,'heatsink_fin_heights_mm','same')); self.heatsink_fin_segments_var.set("auto" if getattr(cfg,'heatsink_fin_segments',0)<=0 else f"{getattr(cfg,'heatsink_fin_segments',0):g}"); self.resistors=list(cfg.resistors); self._refresh_resistor_tree(); self._update_material_fields(); self._update_h_label(); self._update_heatsink_label(); self._draw_layout_preview()
+        self.plate_width_x_var.set(f"{cfg.plate_length_cm:g}"); self.plate_height_y_var.set(f"{cfg.plate_width_cm:g}"); self.plate_thickness_var.set(f"{cfg.plate_thickness_mm:g}"); self.material_var.set(cfg.material_name); self.k_var.set(f"{cfg.thermal_conductivity_w_mk:g}"); self.rho_var.set(f"{cfg.density_kg_m3:g}"); self.cp_var.set(f"{cfg.heat_capacity_j_kgk:g}"); self.ambient_var.set(f"{cfg.ambient_c:g}"); self.h_var.set(f"{cfg.convection_h_w_m2k:g}"); self.grid_var.set(f"{cfg.grid_mm:g}"); self.initial_temp_var.set(f"{cfg.initial_plate_temp_c:g}"); self.max_time_var.set(format_time(cfg.max_time_s).replace(' ','')); self.snapshot_every_var.set(format_time(cfg.snapshot_every_s).replace(' ','')); self.include_steady_var.set(cfg.include_steady_state); self.advanced_cooling_var.set(getattr(cfg,'advanced_cooling_enabled',False)); self.orientation_var.set(display_from_key(ORIENTATION_OPTIONS,getattr(cfg,'orientation','vertical'))); self.environment_var.set(display_from_key(ENVIRONMENT_OPTIONS,getattr(cfg,'environment','open_air'))); self.clearance_var.set(f"{getattr(cfg,'wall_clearance_cm',20):g}"); self.surface_var.set(display_from_key(SURFACE_OPTIONS,getattr(cfg,'surface_finish','bare_metal'))); self.air_movement_var.set(display_from_key(AIR_MOVEMENT_OPTIONS,getattr(cfg,'air_movement','still_air'))); self.hot_air_path_var.set(display_from_key(HOT_AIR_PATH_OPTIONS,getattr(cfg,'hot_air_path','free_rise'))); self.blockage_var.set(f"{getattr(cfg,'blockage_percent',0):g}"); self.heatsink_enabled_var.set(getattr(cfg,'heatsink_enabled',False)); self.heatsink_mode_var.set("Geometry builder" if getattr(cfg,'heatsink_geometry_enabled',False) else "Simple extra area"); self.heatsink_area_var.set(f"{getattr(cfg,'heatsink_extra_area_cm2',0):g}"); self.heatsink_eff_var.set(f"{getattr(cfg,'heatsink_efficiency_percent',70):g}"); self.heatsink_hmul_var.set(f"{getattr(cfg,'heatsink_h_multiplier',1):g}"); self.heatsink_fin_orientation_var.set("Fins run along X, spread across Y" if getattr(cfg,'heatsink_fin_orientation','run_y')=='run_x' else "Fins run along Y, spread across X"); self.heatsink_fin_count_var.set(f"{getattr(cfg,'heatsink_fin_count',0):g}"); self.heatsink_fin_thickness_var.set("same" if getattr(cfg,'heatsink_fin_thickness_mm',0)<=0 else f"{getattr(cfg,'heatsink_fin_thickness_mm',0):g}"); self.heatsink_fin_height_var.set(f"{getattr(cfg,'heatsink_fin_default_height_mm',30):g}"); self.heatsink_fin_run_length_var.set("full" if getattr(cfg,'heatsink_fin_run_length_cm',0)<=0 else f"{getattr(cfg,'heatsink_fin_run_length_cm',0):g}"); self.heatsink_fin_positions_var.set(getattr(cfg,'heatsink_fin_positions_cm','even')); self.heatsink_fin_heights_var.set(getattr(cfg,'heatsink_fin_heights_mm','same')); self.heatsink_fin_segments_var.set("auto" if getattr(cfg,'heatsink_fin_segments',0)<=0 else f"{getattr(cfg,'heatsink_fin_segments',0):g}"); self.extra_cw_var.set(f"{getattr(cfg,'resistor_case_to_plate_cw', self._f(self.extra_cw_var.get(),0.5)):g}"); self.element_cw_var.set(f"{getattr(cfg,'resistor_element_to_case_cw', self._f(self.element_cw_var.get(),0.6)):g}"); self.resistors=list(cfg.resistors); self._refresh_resistor_tree(); self._update_material_fields(); self._update_h_label(); self._update_heatsink_label(); self._draw_layout_preview()
     def _current_snapshot(self):
         if self.result is None: return None
         idx=int(round(float(self.time_slider.get()))); return self.result.snapshots[idx] if 0<=idx<len(self.result.snapshots) else None
@@ -1176,7 +1261,9 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                     back_colors[..., 3] = 0.38 if transparent_plate.get() else 0.85
                     ax3.plot_surface(X, Y, np.full_like(X, -t_cm), facecolors=back_colors, shade=False, linewidth=0, antialiased=False, alpha=float(back_colors[..., 3].mean()))
 
-                # v12: draw fin thermal segments, not whole fins.
+                # v14: draw fin thermal segments with a height temperature gradient.
+                # The base uses local plate temperature. Upper slices use the
+                # same straight-fin model used by fin efficiency.
                 if show_fins.get():
                     for fin in heatsink_fin_segment_specs(cfg):
                         fx = fin["center_x_cm"]
@@ -1184,8 +1271,14 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                         fw = max(0.02, fin["footprint_x_cm"])
                         fr = max(0.02, fin["footprint_y_cm"])
                         fh = max(0.02, fin["height_mm"]/10.0)
-                        tc = self._temp_nearest_3d(fx, fy, x_cm, y_cm, temp)
-                        self._add_box_3d(ax3, fx, fy, -t_cm - fh/2.0, fw, fr, fh, cmap(norm(tc)), alpha=0.72)
+                        base_tc = self._temp_nearest_3d(fx, fy, x_cm, y_cm, temp)
+                        height_slices = 8
+                        dz = fh / height_slices
+                        for zi in range(height_slices):
+                            frac = (zi + 0.5) / height_slices
+                            fin_tc = fin_temperature_at_height(cfg, fin, base_tc, frac)
+                            zc = -t_cm - dz * (zi + 0.5)
+                            self._add_box_3d(ax3, fx, fy, zc, fw, fr, dz, cmap(norm(fin_tc)), alpha=0.72, edge=False)
 
                 resistor_edge_boxes = []
                 if show_res.get():
@@ -1202,7 +1295,8 @@ Use the heatsink dialog's Fin layout designer for individual fin positions and h
                         sy = max(0.03, r.width_mm/10.0)
                         sz = 0.55
                         tc = self._temp_nearest_3d(r.center_x_cm, r.center_y_cm, x_cm, y_cm, temp)
-                        col = cmap(norm(tc))
+                        case_tc = tc + r.power_w * max(0.0, float(getattr(cfg, "resistor_case_to_plate_cw", 0.5)))
+                        col = cmap(norm(case_tc))
                         for zc, sign in z_sides:
                             self._add_box_3d(ax3, r.center_x_cm, r.center_y_cm, zc, sx, sy, sz, col, alpha=0.96)
                             resistor_edge_boxes.append((r.center_x_cm, r.center_y_cm, zc, sx, sy, sz))

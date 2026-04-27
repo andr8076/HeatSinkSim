@@ -1,4 +1,4 @@
-Thermal Plate Simulator v13
+Thermal Plate Simulator v14
 ===========================
 
 This package is intended to run on:
@@ -11,7 +11,7 @@ Main files
 ----------
 
 - run_thermal_sim.py              Cross-platform launcher
-- thermal_plate_sim_v13_gui.py    GUI
+- thermal_plate_sim_v14_gui.py    GUI
 - thermal_core.py                 Simulation engine
 - requirements.txt                Python dependencies
 
@@ -82,7 +82,7 @@ On Arch/EndeavourOS:
     sudo pacman -S tk
 
 
-v13 changes
+v14 changes
 --------------------------
 
 - macOS Tk warning suppression.
@@ -108,7 +108,7 @@ Notes
 The simulator is still an engineering approximation. For real resistor dump hardware, use a temperature sensor, fuses, and thermal cutoff.
 
 
-v13 changes
+v14 changes
 -----------
 - Improved 3D resistor visibility:
   - transparent plate mode
@@ -123,8 +123,27 @@ v13 changes
   - a number forces that many segments per fin
 
 
-v13 changes
+v14 changes
 -----------
 - The 3D view now uses the same heatmap colormap as the 2D view.
 - The 3D view now also follows the same fixed-scale temperature range logic as the 2D view.
 - This keeps 2D and 3D colors consistent for the same snapshot.
+
+
+v14 changes
+-----------
+- Fin height temperature gradient in the 3D viewer:
+  - each fin thermal segment is split into vertical slices
+  - slices are colored using a straight-fin temperature equation
+  - this shows base-to-tip cooling instead of one uniform fin color
+
+- Separate resistor temperature estimates:
+  - plate footprint temperature
+  - estimated resistor case/body temperature
+  - estimated internal resistor element temperature
+  - editable Case→plate °C/W and Element→case °C/W fields
+
+- Precision/effectiveness improvements:
+  - reports hottest plate point coordinates
+  - adds precision notes when grid resolution is too coarse for resistor footprints
+  - 3D resistor blocks are colored by estimated case/body temperature
