@@ -189,20 +189,24 @@ def parse_float(text: str, name: str, min_value: Optional[float] = None) -> floa
 def parse_time_to_seconds(text: str, name: str) -> float:
     """
     Accepts:
-      30s, 1m, 1.5m, 2h
+      30s, 30sec, 1m, 1min, 1.5m, 2h, 2hr
       or plain number = minutes
     """
     raw = str(text).strip().replace(",", ".")
-    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(\s*[smhSMH]?)", raw)
+    m = re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)(?:\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?)",
+        raw,
+        re.IGNORECASE,
+    )
     if not m:
         raise ValueError(f"{name} must be like 30s, 1m, 15m, or 1h.")
 
     value = float(m.group(1))
-    unit = m.group(2).strip().lower()
+    unit = (m.group(2) or "").strip().lower()
 
-    if unit == "s":
+    if unit in ("s", "sec", "secs", "second", "seconds"):
         seconds = value
-    elif unit == "h":
+    elif unit in ("h", "hr", "hrs", "hour", "hours"):
         seconds = value * 3600.0
     else:
         seconds = value * 60.0
