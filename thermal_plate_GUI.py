@@ -84,10 +84,10 @@ class ThermalPlateGUI(tk.Tk):
         # the old fixed 1320x840 window.
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        win_w = max(1000, min(1320, screen_w - 80))
-        win_h = max(680, min(840, screen_h - 110))
+        win_w = max(920, min(1380, screen_w - 70))
+        win_h = max(620, min(920, screen_h - 90))
         self.geometry(f"{win_w}x{win_h}")
-        self.minsize(min(1000, win_w), min(680, win_h))
+        self.minsize(min(860, win_w), min(600, win_h))
 
         self.resistors: List[Resistor] = [Resistor("R1", 50.0, 0.0, 0.0, 50.0, 20.0)]
         self.result: Optional[SimulationResult] = None
@@ -274,17 +274,18 @@ class ThermalPlateGUI(tk.Tk):
 
     # ------------------------------- layout -------------------------------
     def _build_ui(self):
-        self.columnconfigure(0, weight=0)
-        self.columnconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self, padding=8)
-        left.grid(row=0, column=0, sticky="ns")
+        main = ttk.Panedwindow(self, orient="horizontal")
+        main.grid(row=0, column=0, sticky="nsew")
+
+        left = ttk.Frame(main, padding=8)
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
 
         self.tabs = ttk.Notebook(left)
-        self.tabs.grid(row=0, column=0, sticky="ns")
+        self.tabs.grid(row=0, column=0, sticky="nsew")
         self.tab_basic = self._scroll_tab("Basic")
         self.tab_res = self._scroll_tab("Resistors")
         self.tab_tools = self._scroll_tab("Tools")
@@ -297,11 +298,14 @@ class ThermalPlateGUI(tk.Tk):
         self._build_results_tab(self.tab_results)
         self._build_help_tab(self.tab_help)
 
-        right = ttk.Frame(self, padding=8)
-        right.grid(row=0, column=1, sticky="nsew")
+        right = ttk.Frame(main, padding=8)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
         self._build_plot(right)
+        main.add(left, weight=2)
+        main.add(right, weight=3)
+        # Keep left panel practical on small screens while allowing expansion.
+        self.after(10, lambda: main.sashpos(0, max(360, int(self.winfo_width() * 0.36))))
 
     def _scroll_tab(self, title: str) -> ttk.Frame:
         outer = ttk.Frame(self.tabs)
@@ -309,8 +313,8 @@ class ThermalPlateGUI(tk.Tk):
         outer.rowconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
 
-        canvas = tk.Canvas(outer, width=420, highlightthickness=0)
-        canvas.grid(row=0, column=0, sticky="ns")
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         sb.grid(row=0, column=1, sticky="ns")
         canvas.configure(yscrollcommand=sb.set)
@@ -349,6 +353,52 @@ class ThermalPlateGUI(tk.Tk):
 
         inner.columnconfigure(0, weight=1)
         return inner
+
+    def _build_scrollable_dialog(self, win, width=620, height=650):
+        """Create a resize-friendly vertically scrollable frame inside a dialog."""
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        win.geometry(f"{width}x{height}")
+        win.minsize(520, 420)
+
+        outer = ttk.Frame(win)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=sb.set)
+
+        body = ttk.Frame(canvas, padding=12)
+        body_win = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_win, width=canvas.winfo_width()))
+
+        def on_wheel(event):
+            units = self._mousewheel_units(event)
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        def bind_wheel(event=None):
+            canvas.bind_all("<MouseWheel>", on_wheel)
+            canvas.bind_all("<Button-4>", on_wheel)
+            canvas.bind_all("<Button-5>", on_wheel)
+
+        def unbind_wheel(event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        for widget in (canvas, body):
+            widget.bind("<Enter>", bind_wheel)
+            widget.bind("<Leave>", unbind_wheel)
+        body.columnconfigure(1, weight=1)
+        return body
 
     def _entry_row(self, parent, row, label, var, width=14):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
@@ -600,7 +650,7 @@ v15.2 replaces the Matplotlib 3D viewer with a custom Tk Canvas engineering rend
 
     def _advanced_dialog(self):
         win=tk.Toplevel(self); win.title("Advanced cooling"); win.transient(self); win.grab_set()
-        f=ttk.Frame(win,padding=12); f.grid(row=0,column=0,sticky="nsew"); f.columnconfigure(1,weight=1)
+        f = self._build_scrollable_dialog(win, width=620, height=560)
         ttk.Checkbutton(f,text="Use advanced estimate",variable=self.advanced_cooling_var,command=self._update_h_label).grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,8))
         def combo(row,label,var,opts):
             ttk.Label(f,text=label).grid(row=row,column=0,sticky="w",pady=3)
@@ -714,7 +764,7 @@ v15.2 replaces the Matplotlib 3D viewer with a custom Tk Canvas engineering rend
 
     def _heatsink_dialog(self):
         win=tk.Toplevel(self); win.title("Heatsink builder"); win.transient(self); win.grab_set()
-        f=ttk.Frame(win,padding=12); f.grid(row=0,column=0,sticky="nsew"); f.columnconfigure(1,weight=1)
+        f = self._build_scrollable_dialog(win, width=720, height=680)
         ttk.Checkbutton(f,text="Enable heatsink / fins",variable=self.heatsink_enabled_var,command=self._update_heatsink_label).grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,8))
 
         ttk.Label(f,text="Mode").grid(row=1,column=0,sticky="w",pady=3)
