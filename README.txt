@@ -11,7 +11,7 @@ Main files
 ----------
 
 - run_thermal_sim.py              Cross-platform launcher
-- thermal_plate_sim_v15.2_1_gui.py    GUI
+- thermal_plate_GUI.py                GUI
 - thermal_core.py                 Simulation engine
 - requirements.txt                Python dependencies
 

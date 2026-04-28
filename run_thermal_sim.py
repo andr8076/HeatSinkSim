@@ -12,17 +12,16 @@ import platform
 import subprocess
 import sys
 import traceback
+import importlib
+import importlib.util
 
-APP_FILE = "thermal_plate_sim_v15_2_gui.py"
+APP_MODULE = "thermal_plate_GUI"
+APP_FILE = f"{APP_MODULE}.py"
 REQUIRED = ["numpy", "matplotlib"]
 
 
 def has_module(name: str) -> bool:
-    try:
-        __import__(name)
-        return True
-    except Exception:
-        return False
+    return importlib.util.find_spec(name) is not None
 
 
 def main() -> int:
@@ -68,8 +67,11 @@ def main() -> int:
             return 1
 
     try:
-        import thermal_plate_sim_v15_2_gui
-        thermal_plate_sim_v15_2_gui.main()
+        app = importlib.import_module(APP_MODULE)
+        if not hasattr(app, "main"):
+            print(f"{APP_FILE} does not expose a main() entry point.")
+            return 1
+        app.main()
         return 0
     except Exception:
         print("The simulator crashed during startup:")
