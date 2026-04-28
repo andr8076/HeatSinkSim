@@ -1609,6 +1609,96 @@ def candidate_layouts_for_count(
     return generate_candidate_layouts(dummy, plate_x_cm, plate_y_cm, margin_cm)
 
 
+def _perimeter_points_even(
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    count: int,
+    phase: float = 0.0,
+) -> List[Tuple[float, float]]:
+    """Return approximately even points around the inset plate perimeter."""
+    if count <= 0:
+        return []
+    if xmin >= xmax or ymin >= ymax:
+        return []
+
+    w = xmax - xmin
+    h = ymax - ymin
+    perimeter = 2.0 * (w + h)
+    if perimeter <= 1e-9:
+        return []
+
+    points = []
+    for i in range(count):
+        d = ((i + phase) / count) * perimeter
+        d = d % perimeter
+        if d <= w:
+            points.append((xmin + d, ymin))
+        elif d <= w + h:
+            points.append((xmax, ymin + (d - w)))
+        elif d <= 2.0 * w + h:
+            points.append((xmax - (d - (w + h)), ymax))
+        else:
+            points.append((xmin, ymax - (d - (2.0 * w + h))))
+    return points
+
+
+def _even_out_layout(
+    resistors: List[Resistor],
+    plate_x_cm: float,
+    plate_y_cm: float,
+    margin_cm: float,
+) -> Optional[List[Tuple[float, float]]]:
+    """
+    Build an explicit spread-out start map.
+
+    The goal is the user-facing "start from evenly spread corners/edges" seed:
+    for 4 parts this naturally creates a corner-like layout.
+    """
+    count = len(resistors)
+    if count < 2:
+        return None
+
+    max_l_cm = max(r.length_mm for r in resistors) / 10.0
+    max_w_cm = max(r.width_mm for r in resistors) / 10.0
+    xmin = -plate_x_cm / 2.0 + max_l_cm / 2.0 + margin_cm
+    xmax = plate_x_cm / 2.0 - max_l_cm / 2.0 - margin_cm
+    ymin = -plate_y_cm / 2.0 + max_w_cm / 2.0 + margin_cm
+    ymax = plate_y_cm / 2.0 - max_w_cm / 2.0 - margin_cm
+    if xmin >= xmax or ymin >= ymax:
+        return None
+
+    # Two perimeter phases plus one grid fallback improve robustness.
+    variants: List[List[Tuple[float, float]]] = []
+    variants.append(_perimeter_points_even(xmin, xmax, ymin, ymax, count, phase=0.0))
+    variants.append(_perimeter_points_even(xmin, xmax, ymin, ymax, count, phase=0.5))
+
+    grid_layout = _make_grid_layout(resistors, plate_x_cm, plate_y_cm, margin_cm, rows=2, cols=max(2, math.ceil(count / 2)))
+    if grid_layout is not None:
+        variants.append(grid_layout)
+
+    best = None
+    best_min_pair = -1.0
+    for layout in variants:
+        if not layout:
+            continue
+        if not _layout_is_valid(resistors, layout, plate_x_cm, plate_y_cm, margin_cm):
+            continue
+        if len(layout) == 1:
+            return layout
+        min_pair = min(
+            math.hypot(layout[i][0] - layout[j][0], layout[i][1] - layout[j][1])
+            for i in range(len(layout))
+            for j in range(i + 1, len(layout))
+        )
+        if min_pair > best_min_pair:
+            best_min_pair = min_pair
+            best = layout
+
+    return best
+
+
 def generate_candidate_layouts(
     resistors: List[Resistor],
     plate_x_cm: float,
@@ -1635,6 +1725,9 @@ def generate_candidate_layouts(
         for cols in range(1, count + 1):
             if rows * cols >= count:
                 add(_make_grid_layout(resistors, plate_x_cm, plate_y_cm, margin_cm, rows, cols))
+
+    # Explicit even-out spread seed (e.g., 4 parts -> corner-like start).
+    add(_even_out_layout(resistors, plate_x_cm, plate_y_cm, margin_cm))
 
     # Try different margins. Sometimes being slightly less close to the edge
     # wins thermally even if the official margin is small.
@@ -2104,6 +2197,63 @@ def _locally_refine_layout_with_heat_solve(
     return current, current_score, current_info, evaluations
 
 
+def _shake_layout_with_heat_solve(
+    cfg: PlateConfig,
+    start_layout: List[Tuple[float, float]],
+    margin_cm: float,
+    grid_mm: float,
+    cache: Dict,
+    rng,
+    shake_sigma_cm: float,
+    shake_attempts: int,
+    stop_event: Optional[threading.Event],
+) -> Tuple[List[Tuple[float, float]], float, Dict, int]:
+    """
+    Try random multi-resistor perturbations and keep the best valid result.
+
+    This helps the optimizer escape shallow local minima where single-resistor
+    axis/diagonal moves cannot find a better basin.
+    """
+    best_layout = [tuple(p) for p in start_layout]
+    best_score, best_info = _score_layout_by_coarse_heat_solve(
+        cfg, best_layout, margin_cm, grid_mm, cache, stop_event=stop_event
+    )
+    evaluations = 1
+
+    bounds = [_center_bounds_for_resistor(r, cfg.plate_length_cm, cfg.plate_width_cm, margin_cm) for r in cfg.resistors]
+    count = len(cfg.resistors)
+
+    for _ in range(max(1, shake_attempts)):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Optimization was cancelled.")
+
+        # Move a subset (at least 2 where possible) to perform a meaningful kick.
+        move_n = min(count, 2 + int(rng.integers(0, max(1, count // 2 + 1))))
+        move_ids = set(int(i) for i in rng.choice(count, size=move_n, replace=False))
+
+        trial = list(best_layout)
+        for i in move_ids:
+            x, y = trial[i]
+            xmin, xmax, ymin, ymax = bounds[i]
+            nx = min(xmax, max(xmin, float(x + rng.normal(0.0, shake_sigma_cm))))
+            ny = min(ymax, max(ymin, float(y + rng.normal(0.0, shake_sigma_cm))))
+            trial[i] = (nx, ny)
+
+        if not _layout_is_valid(cfg.resistors, trial, cfg.plate_length_cm, cfg.plate_width_cm, margin_cm):
+            continue
+
+        trial_score, trial_info = _score_layout_by_coarse_heat_solve(
+            cfg, trial, margin_cm, grid_mm, cache, stop_event=stop_event
+        )
+        evaluations += 1
+        if trial_score < best_score - 0.001:
+            best_layout = [tuple(p) for p in trial]
+            best_score = trial_score
+            best_info = trial_info
+
+    return best_layout, best_score, best_info, evaluations
+
+
 def optimize_layout_deep(
     cfg: PlateConfig,
     margin_cm: float,
@@ -2149,6 +2299,9 @@ def optimize_layout_deep(
             "step_factor": [0.18, 0.10, 0.055, 0.030, 0.016],
             "passes": 2,
             "fine_grid_factor": 0.85,
+            "shake_rounds": 1,
+            "shake_attempts": 24,
+            "shake_sigma_factor": 0.08,
         }
     else:
         settings = {
@@ -2160,7 +2313,16 @@ def optimize_layout_deep(
             "step_factor": [0.20, 0.125, 0.075, 0.045, 0.025, 0.014],
             "passes": 2,
             "fine_grid_factor": 0.75,
+            "shake_rounds": 2,
+            "shake_attempts": 42,
+            "shake_sigma_factor": 0.10,
         }
+    if "extreme" in depth_key:
+        settings.update({
+            "shake_rounds": 3,
+            "shake_attempts": 72,
+            "shake_sigma_factor": 0.12,
+        })
 
     count = len(cfg.resistors)
     if count < 1:
@@ -2371,6 +2533,37 @@ def optimize_layout_deep(
         )
         tried += evals
 
+        # Basin-hopping: after deterministic coordinate search, try a few
+        # random multi-point kicks and then refine again.
+        for _ in range(settings["shake_rounds"]):
+            shaken_layout, shaken_score, shaken_info, shake_evals = _shake_layout_with_heat_solve(
+                cfg=cfg,
+                start_layout=layout,
+                margin_cm=margin_cm,
+                grid_mm=coarse_grid_mm,
+                cache=cache,
+                rng=rng,
+                shake_sigma_cm=max(0.18, min_dim * settings["shake_sigma_factor"]),
+                shake_attempts=settings["shake_attempts"],
+                stop_event=stop_event,
+            )
+            tried += shake_evals
+
+            if shaken_score < score - 0.001:
+                layout, score, info, evals = _locally_refine_layout_with_heat_solve(
+                    cfg=cfg,
+                    start_layout=shaken_layout,
+                    margin_cm=margin_cm,
+                    grid_mm=coarse_grid_mm,
+                    cache=cache,
+                    step_sizes_cm=step_sizes,
+                    stop_event=stop_event,
+                    progress_callback=progress_callback,
+                    label=f"candidate {start_i} rebound",
+                    max_passes_per_step=1,
+                )
+                tried += evals
+
         if score < best_score:
             best_layout = layout
             best_score = score
@@ -2381,7 +2574,7 @@ def optimize_layout_deep(
         progress_callback("Running finer-grid verification/refinement...")
 
     fine_cache: Dict = {}
-    fine_steps = [max(0.20, min_dim * 0.025), max(0.15, min_dim * 0.012), 0.35]
+    fine_steps = [0.35, max(0.20, min_dim * 0.025), max(0.15, min_dim * 0.012)]
     best_layout, fine_score, fine_info, fine_evals = _locally_refine_layout_with_heat_solve(
         cfg=cfg,
         start_layout=best_layout,
